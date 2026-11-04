@@ -1,3 +1,19 @@
 Model,DeploymentType,Region,InputPer1M,OutputPer1M,Currency,Source
-gpt-4.1,Global,*,,,USD,Fill in your contracted or list price per 1M tokens (empty = not priced)
-gpt-4.1-mini,DataZone,swedencentral,,,USD,Region-specific row (Region * applies to every region)
+gpt-4.1,Global,*,2.00,8.00,USD,Azure retail list price 2026-11 (gpt 4.1 Inp/Outp glbl)
+gpt-4.1,DataZone,*,2.20,8.80,USD,Azure retail list price 2026-11 (gpt 4.1 Inp/Outp Data Zone)
+gpt-4.1,Regional,swedencentral,2.42,9.68,USD,Azure retail list price 2026-11 (gpt 4.1 Inp/Outp regnl)
+gpt-4.1,Regional,eastus2,2.20,8.80,USD,Azure retail list price 2026-11 (gpt 4.1 Inp/Outp regnl)
+gpt-5.1,Global,*,1.25,10.00,USD,Azure retail list price 2026-11 (GPT 5.1 inp/opt Gl)
+gpt-5.1,DataZone,*,1.375,11.00,USD,Azure retail list price 2026-11 (GPT 5.1 inp/opt Dz)
+gpt-5.4,Global,*,2.50,15.00,USD,Azure retail list price 2026-11 (5.4 inp/opt Gl; <272k context)
+gpt-5.4,DataZone,*,2.75,16.50,USD,Azure retail list price 2026-11 (5.4 inp/opt Dz; <272k context)
+gpt-5.4-mini,Global,*,0.75,4.50,USD,Azure retail list price 2026-11 (5.4 mini Inp/Opt Gl)
+gpt-5.4-mini,DataZone,*,0.825,4.95,USD,Azure retail list price 2026-11 (5.4 mini Inp/Opt Dz)
+gpt-5.6-sol,Global,*,4.00,20.00,USD,Azure retail list price 2026-11 (5.6 sol ShortCo Std Gl; short-context price)
+gpt-5.6-sol,DataZone,*,4.40,22.00,USD,Azure retail list price 2026-11 (5.6 sol ShortCo Std DZ; short-context price)
+gpt-6-astra,Global,*,10.00,50.00,USD,Azure retail list price 2026-11 (6-astra ShortCo Std Gl; short-context price)
+gpt-6-astra,DataZone,*,12.00,60.00,USD,Azure retail list price 2026-11 (6-astra ShortCo Std DZ; short-context price)
+MAI-Thinking-1,Global,*,2.00,8.00,USD,Azure retail list price 2026-11 (MAI-Thinking-1 Inp/Opt glbl)
+Phi-4-reasoning,Global,*,0.125,0.50,USD,Azure retail list price 2026-11 (Phi-4-reasoning Input/Output)
+gpt-realtime-mini,Global,*,,,USD,Not priced: text and audio tokens have different prices and token metrics do not split them
+gpt-image-2,Global,*,,,USD,Not priced: text and image tokens have different prices and token metrics do not split them

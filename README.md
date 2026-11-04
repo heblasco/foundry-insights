@@ -216,9 +216,10 @@ Notes on the Models sheet:
 
 Costs are an **estimate at list price**, never a bill: they ignore discounts, EA/MCA agreements, cached-token pricing, Batch and PTU reservations.
 
-- `--fetch-prices` queries the public Retail Prices API and keeps only **exact, unambiguous** matches for model + deployment type (`Global`, `DataZone`, `Regional`, derived from the SKU) + region + direction (input/output). Cached, batch, priority, long-context, fine-tuning, realtime, audio, image and embedding meters are excluded. When several prices fit, none is chosen.
+- `--fetch-prices` queries the public Retail Prices API and keeps only **exact, unambiguous** matches for model + deployment type (`Global`, `DataZone`, `Regional`, derived from the SKU) + region + direction (input/output). Cached, batch, priority, flex, short/long-context, fine-tuning, realtime, audio, image and embedding meters are excluded. When several prices fit, none is chosen.
 - PTU (`Provisioned*`) and Batch deployments are not priced per token and get no cost.
-- `--prices` (template in `prices.example.csv`: `Model, DeploymentType, Region, InputPer1M, OutputPer1M, Currency, Source`) overrides fetched prices. `DeploymentType` must be `Global`, `DataZone` or `Regional`; `Region` `*` (or empty) applies the row to every region.
+- `--prices` (template in `prices.example.csv`: `Model, DeploymentType, Region, InputPer1M, OutputPer1M, Currency, Source`) overrides fetched prices. `DeploymentType` must be `Global`, `DataZone` or `Regional`; `Region` `*` (or empty) applies the row to every region. Rows with no price are ignored.
+- `prices.example.csv` ships with Standard list prices in USD, taken from the [Azure OpenAI pricing page](https://azure.microsoft.com/en-us/pricing/details/azure-openai/) and Retail Prices API in November 2026. Models with short/long-context tiers use the short-context price. Realtime and image models are left unpriced because token metrics do not split text, audio and image tokens. Review it against your agreement before use.
 - `EstCost` = input tokens × input price + output tokens × output price over the covered minutes; `EstMonthlyCost` extrapolates it to 30 days.
 - Models without a price are listed on the console and in the Summary sheet.
 

@@ -601,7 +601,9 @@ def latency_summary(con: duckdb.DuckDBPyConnection):
 # ---------------------------------------------------------------------------------------------------------------
 PRICE_COLS = ["Model", "DeploymentType", "Region", "InputPer1M", "OutputPer1M", "Currency", "Source"]
 RETAIL_API = "https://prices.azure.com/api/retail/prices"
-_EXCLUDE = re.compile(r"\b(cd|cached|cache|batch|pp|longco|shortco|flex|ft|fine|tuning|training|hosting|hosted|grdr|"
+# Non-standard tiers (cached, batch, priority, flex, short/long context, fine-tuning...) are never candidates.
+_EXCLUDE = re.compile(r"\b(cd|cached|cache|batch|pp|pri|priority|longco|shortco|loco|shco|flex|fl|ft|fine|tuning|"
+                      r"training|hosting|hosted|grdr|"
                       r"realtime|audio|image|img|vision|embedding|aud)\b", re.I)
 _DIR = [("Input", re.compile(r"\b(inp|input)\b", re.I)), ("Output", re.compile(r"\b(outp|opt|output|out)\b", re.I))]
 _TYPE = [("DataZone", re.compile(r"\b(data\s*zone|dzone|dz)\b", re.I)), ("Global", re.compile(r"\b(glbl|gl|global)\b", re.I)),
