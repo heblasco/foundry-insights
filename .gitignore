@@ -1,0 +1,30 @@
+# Extraction and report outputs (may contain tenant/subscription/resource data)
+output/
+*.csv
+*.xlsx
+*.log
+run.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# Secrets and local configuration
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.publishsettings
+.azure/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

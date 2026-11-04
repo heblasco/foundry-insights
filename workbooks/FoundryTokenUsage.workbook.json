@@ -1,0 +1,1986 @@
+{
+  "version": "Notebook/1.0",
+  "items": [
+    {
+      "type": 1,
+      "name": "intro",
+      "content": {
+        "json": "## Azure AI Foundry / Azure OpenAI - per-minute consumption\nInput tokens (`ProcessedPromptTokens`) and output tokens (`GeneratedTokens`) kept separate, requests (`AzureOpenAIRequests`) and PTU utilization (`Provisioned-managed Utilization V2`).\n\n> **Limits**: charts support ~10,000 points and 100 series; with PT1M use ranges <= 6 days (1 day recommended). The 25 deployments with the highest volume are shown. A metrics query supports up to 200 resources. **For per-minute P95/P99 and 30-90 day periods use `Export-FoundryTokenMetrics.ps1` + `foundry_token_stats.py`.**"
+      }
+    },
+    {
+      "type": 9,
+      "name": "params",
+      "content": {
+        "version": "KqlParameterItem/1.0",
+        "crossComponentResources": [
+          "{Subscriptions}"
+        ],
+        "parameters": [
+          {
+            "id": "7eb1014f-5de8-43df-a815-f60c32b5a23c",
+            "version": "KqlParameterItem/1.0",
+            "name": "Subscriptions",
+            "label": "Subscriptions",
+            "type": 6,
+            "isRequired": true,
+            "multiSelect": true,
+            "quote": "'",
+            "delimiter": ",",
+            "typeSettings": {
+              "additionalResourceOptions": [
+                "value::all"
+              ],
+              "includeAll": false,
+              "showDefault": false
+            },
+            "value": [
+              "value::all"
+            ]
+          },
+          {
+            "id": "e0d06a7d-d6d3-422c-971b-c9b446788237",
+            "version": "KqlParameterItem/1.0",
+            "name": "Resources",
+            "label": "OpenAI/AIServices accounts",
+            "type": 5,
+            "isRequired": true,
+            "multiSelect": true,
+            "quote": "'",
+            "delimiter": ",",
+            "query": "resources\n| where type =~ 'microsoft.cognitiveservices/accounts'\n| where kind in~ ('OpenAI','AIServices')\n| project value = id, label = name, selected = true, group = subscriptionId",
+            "crossComponentResources": [
+              "{Subscriptions}"
+            ],
+            "typeSettings": {
+              "additionalResourceOptions": [
+                "value::all"
+              ],
+              "showDefault": false
+            },
+            "value": [
+              "value::all"
+            ],
+            "queryType": 1,
+            "resourceType": "microsoft.resourcegraph/resources"
+          },
+          {
+            "id": "d77f07d6-04fa-4d0d-99fb-54fae704505a",
+            "version": "KqlParameterItem/1.0",
+            "name": "TimeRange",
+            "label": "Time range",
+            "type": 4,
+            "isRequired": true,
+            "typeSettings": {
+              "selectableValues": [
+                {
+                  "durationMs": 3600000
+                },
+                {
+                  "durationMs": 14400000
+                },
+                {
+                  "durationMs": 43200000
+                },
+                {
+                  "durationMs": 86400000
+                },
+                {
+                  "durationMs": 172800000
+                },
+                {
+                  "durationMs": 259200000
+                },
+                {
+                  "durationMs": 604800000
+                },
+                {
+                  "durationMs": 2592000000
+                }
+              ],
+              "allowCustom": true
+            },
+            "value": {
+              "durationMs": 86400000
+            }
+          },
+          {
+            "id": "ede26599-a24a-4cd3-9b86-952f80841563",
+            "version": "KqlParameterItem/1.0",
+            "name": "TimeGrain",
+            "label": "Granularity",
+            "type": 2,
+            "isRequired": true,
+            "jsonData": "[{\"value\": \"PT1M\", \"label\": \"1 minute\"}, {\"value\": \"PT5M\", \"label\": \"5 minutes\"}, {\"value\": \"PT1H\", \"label\": \"1 hour\"}]",
+            "typeSettings": {
+              "showDefault": false
+            },
+            "value": "PT1M"
+          }
+        ],
+        "style": "pills",
+        "queryType": 1,
+        "resourceType": "microsoft.resourcegraph/resources"
+      }
+    },
+    {
+      "type": 3,
+      "name": "inventory",
+      "content": {
+        "version": "KqlItem/1.0",
+        "title": "Account inventory",
+        "size": 0,
+        "queryType": 1,
+        "resourceType": "microsoft.resourcegraph/resources",
+        "crossComponentResources": [
+          "{Subscriptions}"
+        ],
+        "query": "resources\n| where type =~ 'microsoft.cognitiveservices/accounts'\n| where id in~ ({Resources})\n| join kind=leftouter (resourcecontainers | where type =~ 'microsoft.resources/subscriptions' | project subscriptionId, SubscriptionName = name) on subscriptionId\n| project Account = id, kind, location, SubscriptionName, resourceGroup, sku = tostring(sku.name)\n| order by SubscriptionName asc, Account asc",
+        "gridSettings": {
+          "formatters": [
+            {
+              "columnMatch": "Account",
+              "formatter": 13,
+              "formatOptions": {
+                "linkTarget": null,
+                "showIcon": true
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": 10,
+      "name": "prompt-PT1M",
+      "content": {
+        "chartId": "workbook08f5073e775743ff871fd9fb",
+        "version": "MetricsItem/2.0",
+        "size": 0,
+        "chartType": 2,
+        "resourceType": "microsoft.cognitiveservices/accounts",
+        "metricScope": 0,
+        "resourceParameter": "Resources",
+        "resourceIds": [
+          "{Resources}"
+        ],
+        "timeContextFromParameter": "TimeRange",
+        "timeGrain": "PT1M",
+        "metrics": [
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--ProcessedPromptTokens",
+            "aggregation": 1
+          }
+        ],
+        "splitBy": [
+          {
+            "dimension": "ModelDeploymentName",
+            "sortOrder": -1
+          }
+        ],
+        "splitBySortOrder": -1,
+        "splitByLimit": 25,
+        "title": "Input - ProcessedPromptTokens (sum per interval) - PT1M",
+        "showOpenInMe": true,
+        "gridSettings": {
+          "rowLimit": 10000
+        }
+      },
+      "conditionalVisibility": {
+        "parameterName": "TimeGrain",
+        "comparison": "isEqualTo",
+        "value": "PT1M"
+      }
+    },
+    {
+      "type": 10,
+      "name": "prompt-PT5M",
+      "content": {
+        "chartId": "workbook57f56fde5e214602bd14302a",
+        "version": "MetricsItem/2.0",
+        "size": 0,
+        "chartType": 2,
+        "resourceType": "microsoft.cognitiveservices/accounts",
+        "metricScope": 0,
+        "resourceParameter": "Resources",
+        "resourceIds": [
+          "{Resources}"
+        ],
+        "timeContextFromParameter": "TimeRange",
+        "timeGrain": "PT5M",
+        "metrics": [
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--ProcessedPromptTokens",
+            "aggregation": 1
+          }
+        ],
+        "splitBy": [
+          {
+            "dimension": "ModelDeploymentName",
+            "sortOrder": -1
+          }
+        ],
+        "splitBySortOrder": -1,
+        "splitByLimit": 25,
+        "title": "Input - ProcessedPromptTokens (sum per interval) - PT5M",
+        "showOpenInMe": true,
+        "gridSettings": {
+          "rowLimit": 10000
+        }
+      },
+      "conditionalVisibility": {
+        "parameterName": "TimeGrain",
+        "comparison": "isEqualTo",
+        "value": "PT5M"
+      }
+    },
+    {
+      "type": 10,
+      "name": "prompt-PT1H",
+      "content": {
+        "chartId": "workbook494c755c65774f15b6dc08c8",
+        "version": "MetricsItem/2.0",
+        "size": 0,
+        "chartType": 2,
+        "resourceType": "microsoft.cognitiveservices/accounts",
+        "metricScope": 0,
+        "resourceParameter": "Resources",
+        "resourceIds": [
+          "{Resources}"
+        ],
+        "timeContextFromParameter": "TimeRange",
+        "timeGrain": "PT1H",
+        "metrics": [
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--ProcessedPromptTokens",
+            "aggregation": 1
+          }
+        ],
+        "splitBy": [
+          {
+            "dimension": "ModelDeploymentName",
+            "sortOrder": -1
+          }
+        ],
+        "splitBySortOrder": -1,
+        "splitByLimit": 25,
+        "title": "Input - ProcessedPromptTokens (sum per interval) - PT1H",
+        "showOpenInMe": true,
+        "gridSettings": {
+          "rowLimit": 10000
+        }
+      },
+      "conditionalVisibility": {
+        "parameterName": "TimeGrain",
+        "comparison": "isEqualTo",
+        "value": "PT1H"
+      }
+    },
+    {
+      "type": 10,
+      "name": "generated-PT1M",
+      "content": {
+        "chartId": "workbook106ae7858f094e43ad5f54c9",
+        "version": "MetricsItem/2.0",
+        "size": 0,
+        "chartType": 2,
+        "resourceType": "microsoft.cognitiveservices/accounts",
+        "metricScope": 0,
+        "resourceParameter": "Resources",
+        "resourceIds": [
+          "{Resources}"
+        ],
+        "timeContextFromParameter": "TimeRange",
+        "timeGrain": "PT1M",
+        "metrics": [
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--GeneratedTokens",
+            "aggregation": 1
+          }
+        ],
+        "splitBy": [
+          {
+            "dimension": "ModelDeploymentName",
+            "sortOrder": -1
+          }
+        ],
+        "splitBySortOrder": -1,
+        "splitByLimit": 25,
+        "title": "Output - GeneratedTokens (sum per interval) - PT1M",
+        "showOpenInMe": true,
+        "gridSettings": {
+          "rowLimit": 10000
+        }
+      },
+      "conditionalVisibility": {
+        "parameterName": "TimeGrain",
+        "comparison": "isEqualTo",
+        "value": "PT1M"
+      }
+    },
+    {
+      "type": 10,
+      "name": "generated-PT5M",
+      "content": {
+        "chartId": "workbookf65ad41f566545d1a50916f1",
+        "version": "MetricsItem/2.0",
+        "size": 0,
+        "chartType": 2,
+        "resourceType": "microsoft.cognitiveservices/accounts",
+        "metricScope": 0,
+        "resourceParameter": "Resources",
+        "resourceIds": [
+          "{Resources}"
+        ],
+        "timeContextFromParameter": "TimeRange",
+        "timeGrain": "PT5M",
+        "metrics": [
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--GeneratedTokens",
+            "aggregation": 1
+          }
+        ],
+        "splitBy": [
+          {
+            "dimension": "ModelDeploymentName",
+            "sortOrder": -1
+          }
+        ],
+        "splitBySortOrder": -1,
+        "splitByLimit": 25,
+        "title": "Output - GeneratedTokens (sum per interval) - PT5M",
+        "showOpenInMe": true,
+        "gridSettings": {
+          "rowLimit": 10000
+        }
+      },
+      "conditionalVisibility": {
+        "parameterName": "TimeGrain",
+        "comparison": "isEqualTo",
+        "value": "PT5M"
+      }
+    },
+    {
+      "type": 10,
+      "name": "generated-PT1H",
+      "content": {
+        "chartId": "workbook5f01699d2e1045afa2d2ea6c",
+        "version": "MetricsItem/2.0",
+        "size": 0,
+        "chartType": 2,
+        "resourceType": "microsoft.cognitiveservices/accounts",
+        "metricScope": 0,
+        "resourceParameter": "Resources",
+        "resourceIds": [
+          "{Resources}"
+        ],
+        "timeContextFromParameter": "TimeRange",
+        "timeGrain": "PT1H",
+        "metrics": [
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--GeneratedTokens",
+            "aggregation": 1
+          }
+        ],
+        "splitBy": [
+          {
+            "dimension": "ModelDeploymentName",
+            "sortOrder": -1
+          }
+        ],
+        "splitBySortOrder": -1,
+        "splitByLimit": 25,
+        "title": "Output - GeneratedTokens (sum per interval) - PT1H",
+        "showOpenInMe": true,
+        "gridSettings": {
+          "rowLimit": 10000
+        }
+      },
+      "conditionalVisibility": {
+        "parameterName": "TimeGrain",
+        "comparison": "isEqualTo",
+        "value": "PT1H"
+      }
+    },
+    {
+      "type": 10,
+      "name": "requests-PT1M",
+      "content": {
+        "chartId": "workbookf88f016898c642cc8da0a899",
+        "version": "MetricsItem/2.0",
+        "size": 0,
+        "chartType": 2,
+        "resourceType": "microsoft.cognitiveservices/accounts",
+        "metricScope": 0,
+        "resourceParameter": "Resources",
+        "resourceIds": [
+          "{Resources}"
+        ],
+        "timeContextFromParameter": "TimeRange",
+        "timeGrain": "PT1M",
+        "metrics": [
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--AzureOpenAIRequests",
+            "aggregation": 1
+          }
+        ],
+        "splitBy": [
+          {
+            "dimension": "ModelDeploymentName",
+            "sortOrder": -1
+          }
+        ],
+        "splitBySortOrder": -1,
+        "splitByLimit": 25,
+        "title": "AzureOpenAIRequests (sum per interval) - PT1M",
+        "showOpenInMe": true,
+        "gridSettings": {
+          "rowLimit": 10000
+        }
+      },
+      "conditionalVisibility": {
+        "parameterName": "TimeGrain",
+        "comparison": "isEqualTo",
+        "value": "PT1M"
+      }
+    },
+    {
+      "type": 10,
+      "name": "requests-PT5M",
+      "content": {
+        "chartId": "workbookeeb80747b4584cb88c52232b",
+        "version": "MetricsItem/2.0",
+        "size": 0,
+        "chartType": 2,
+        "resourceType": "microsoft.cognitiveservices/accounts",
+        "metricScope": 0,
+        "resourceParameter": "Resources",
+        "resourceIds": [
+          "{Resources}"
+        ],
+        "timeContextFromParameter": "TimeRange",
+        "timeGrain": "PT5M",
+        "metrics": [
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--AzureOpenAIRequests",
+            "aggregation": 1
+          }
+        ],
+        "splitBy": [
+          {
+            "dimension": "ModelDeploymentName",
+            "sortOrder": -1
+          }
+        ],
+        "splitBySortOrder": -1,
+        "splitByLimit": 25,
+        "title": "AzureOpenAIRequests (sum per interval) - PT5M",
+        "showOpenInMe": true,
+        "gridSettings": {
+          "rowLimit": 10000
+        }
+      },
+      "conditionalVisibility": {
+        "parameterName": "TimeGrain",
+        "comparison": "isEqualTo",
+        "value": "PT5M"
+      }
+    },
+    {
+      "type": 10,
+      "name": "requests-PT1H",
+      "content": {
+        "chartId": "workbook3f0764eb0918408580fa9e39",
+        "version": "MetricsItem/2.0",
+        "size": 0,
+        "chartType": 2,
+        "resourceType": "microsoft.cognitiveservices/accounts",
+        "metricScope": 0,
+        "resourceParameter": "Resources",
+        "resourceIds": [
+          "{Resources}"
+        ],
+        "timeContextFromParameter": "TimeRange",
+        "timeGrain": "PT1H",
+        "metrics": [
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--AzureOpenAIRequests",
+            "aggregation": 1
+          }
+        ],
+        "splitBy": [
+          {
+            "dimension": "ModelDeploymentName",
+            "sortOrder": -1
+          }
+        ],
+        "splitBySortOrder": -1,
+        "splitByLimit": 25,
+        "title": "AzureOpenAIRequests (sum per interval) - PT1H",
+        "showOpenInMe": true,
+        "gridSettings": {
+          "rowLimit": 10000
+        }
+      },
+      "conditionalVisibility": {
+        "parameterName": "TimeGrain",
+        "comparison": "isEqualTo",
+        "value": "PT1H"
+      }
+    },
+    {
+      "type": 10,
+      "name": "throttled-PT1M",
+      "content": {
+        "chartId": "workbook04aea4beb21b45e2b06e7a83",
+        "version": "MetricsItem/2.0",
+        "size": 0,
+        "chartType": 2,
+        "resourceType": "microsoft.cognitiveservices/accounts",
+        "metricScope": 0,
+        "resourceParameter": "Resources",
+        "resourceIds": [
+          "{Resources}"
+        ],
+        "timeContextFromParameter": "TimeRange",
+        "timeGrain": "PT1M",
+        "metrics": [
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--AzureOpenAIRequests",
+            "aggregation": 1
+          }
+        ],
+        "splitBy": [
+          {
+            "dimension": "ModelDeploymentName",
+            "sortOrder": -1
+          }
+        ],
+        "splitBySortOrder": -1,
+        "splitByLimit": 25,
+        "title": "Throttling - AzureOpenAIRequests with StatusCode 429 (sum per interval) - PT1M",
+        "showOpenInMe": true,
+        "gridSettings": {
+          "rowLimit": 10000
+        },
+        "filters": [
+          {
+            "key": "StatusCode",
+            "operator": 0,
+            "values": [
+              "429"
+            ]
+          }
+        ]
+      },
+      "conditionalVisibility": {
+        "parameterName": "TimeGrain",
+        "comparison": "isEqualTo",
+        "value": "PT1M"
+      }
+    },
+    {
+      "type": 10,
+      "name": "throttled-PT5M",
+      "content": {
+        "chartId": "workbookd595aa7c08864a538557dcae",
+        "version": "MetricsItem/2.0",
+        "size": 0,
+        "chartType": 2,
+        "resourceType": "microsoft.cognitiveservices/accounts",
+        "metricScope": 0,
+        "resourceParameter": "Resources",
+        "resourceIds": [
+          "{Resources}"
+        ],
+        "timeContextFromParameter": "TimeRange",
+        "timeGrain": "PT5M",
+        "metrics": [
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--AzureOpenAIRequests",
+            "aggregation": 1
+          }
+        ],
+        "splitBy": [
+          {
+            "dimension": "ModelDeploymentName",
+            "sortOrder": -1
+          }
+        ],
+        "splitBySortOrder": -1,
+        "splitByLimit": 25,
+        "title": "Throttling - AzureOpenAIRequests with StatusCode 429 (sum per interval) - PT5M",
+        "showOpenInMe": true,
+        "gridSettings": {
+          "rowLimit": 10000
+        },
+        "filters": [
+          {
+            "key": "StatusCode",
+            "operator": 0,
+            "values": [
+              "429"
+            ]
+          }
+        ]
+      },
+      "conditionalVisibility": {
+        "parameterName": "TimeGrain",
+        "comparison": "isEqualTo",
+        "value": "PT5M"
+      }
+    },
+    {
+      "type": 10,
+      "name": "throttled-PT1H",
+      "content": {
+        "chartId": "workbookf6e6b3cc3b614a419f69991c",
+        "version": "MetricsItem/2.0",
+        "size": 0,
+        "chartType": 2,
+        "resourceType": "microsoft.cognitiveservices/accounts",
+        "metricScope": 0,
+        "resourceParameter": "Resources",
+        "resourceIds": [
+          "{Resources}"
+        ],
+        "timeContextFromParameter": "TimeRange",
+        "timeGrain": "PT1H",
+        "metrics": [
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--AzureOpenAIRequests",
+            "aggregation": 1
+          }
+        ],
+        "splitBy": [
+          {
+            "dimension": "ModelDeploymentName",
+            "sortOrder": -1
+          }
+        ],
+        "splitBySortOrder": -1,
+        "splitByLimit": 25,
+        "title": "Throttling - AzureOpenAIRequests with StatusCode 429 (sum per interval) - PT1H",
+        "showOpenInMe": true,
+        "gridSettings": {
+          "rowLimit": 10000
+        },
+        "filters": [
+          {
+            "key": "StatusCode",
+            "operator": 0,
+            "values": [
+              "429"
+            ]
+          }
+        ]
+      },
+      "conditionalVisibility": {
+        "parameterName": "TimeGrain",
+        "comparison": "isEqualTo",
+        "value": "PT1H"
+      }
+    },
+    {
+      "type": 10,
+      "name": "ptu-PT1M",
+      "content": {
+        "chartId": "workbook8462b7324e5c4c49a3cbf9b3",
+        "version": "MetricsItem/2.0",
+        "size": 0,
+        "chartType": 2,
+        "resourceType": "microsoft.cognitiveservices/accounts",
+        "metricScope": 0,
+        "resourceParameter": "Resources",
+        "resourceIds": [
+          "{Resources}"
+        ],
+        "timeContextFromParameter": "TimeRange",
+        "timeGrain": "PT1M",
+        "metrics": [
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--AzureOpenAIProvisionedManagedUtilizationV2",
+            "aggregation": 3
+          }
+        ],
+        "splitBy": [
+          {
+            "dimension": "ModelDeploymentName",
+            "sortOrder": -1
+          }
+        ],
+        "splitBySortOrder": -1,
+        "splitByLimit": 25,
+        "title": "PTU - Provisioned-managed Utilization V2 (max %) - PT1M",
+        "showOpenInMe": true,
+        "gridSettings": {
+          "rowLimit": 10000
+        }
+      },
+      "conditionalVisibility": {
+        "parameterName": "TimeGrain",
+        "comparison": "isEqualTo",
+        "value": "PT1M"
+      }
+    },
+    {
+      "type": 10,
+      "name": "ptu-PT5M",
+      "content": {
+        "chartId": "workbook6e1bf38099d247c09ad7fadf",
+        "version": "MetricsItem/2.0",
+        "size": 0,
+        "chartType": 2,
+        "resourceType": "microsoft.cognitiveservices/accounts",
+        "metricScope": 0,
+        "resourceParameter": "Resources",
+        "resourceIds": [
+          "{Resources}"
+        ],
+        "timeContextFromParameter": "TimeRange",
+        "timeGrain": "PT5M",
+        "metrics": [
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--AzureOpenAIProvisionedManagedUtilizationV2",
+            "aggregation": 3
+          }
+        ],
+        "splitBy": [
+          {
+            "dimension": "ModelDeploymentName",
+            "sortOrder": -1
+          }
+        ],
+        "splitBySortOrder": -1,
+        "splitByLimit": 25,
+        "title": "PTU - Provisioned-managed Utilization V2 (max %) - PT5M",
+        "showOpenInMe": true,
+        "gridSettings": {
+          "rowLimit": 10000
+        }
+      },
+      "conditionalVisibility": {
+        "parameterName": "TimeGrain",
+        "comparison": "isEqualTo",
+        "value": "PT5M"
+      }
+    },
+    {
+      "type": 10,
+      "name": "ptu-PT1H",
+      "content": {
+        "chartId": "workbook50d1cc564b9a41e1a3c81306",
+        "version": "MetricsItem/2.0",
+        "size": 0,
+        "chartType": 2,
+        "resourceType": "microsoft.cognitiveservices/accounts",
+        "metricScope": 0,
+        "resourceParameter": "Resources",
+        "resourceIds": [
+          "{Resources}"
+        ],
+        "timeContextFromParameter": "TimeRange",
+        "timeGrain": "PT1H",
+        "metrics": [
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--AzureOpenAIProvisionedManagedUtilizationV2",
+            "aggregation": 3
+          }
+        ],
+        "splitBy": [
+          {
+            "dimension": "ModelDeploymentName",
+            "sortOrder": -1
+          }
+        ],
+        "splitBySortOrder": -1,
+        "splitByLimit": 25,
+        "title": "PTU - Provisioned-managed Utilization V2 (max %) - PT1H",
+        "showOpenInMe": true,
+        "gridSettings": {
+          "rowLimit": 10000
+        }
+      },
+      "conditionalVisibility": {
+        "parameterName": "TimeGrain",
+        "comparison": "isEqualTo",
+        "value": "PT1H"
+      }
+    },
+    {
+      "type": 1,
+      "name": "ptu-note",
+      "content": {
+        "json": "_Utilization V2 only returns data for Provisioned / Global/Data Zone Provisioned deployments. It is a percentage: never sum it across deployments._"
+      }
+    },
+    {
+      "type": 1,
+      "name": "detail-intro",
+      "content": {
+        "json": "## Per model / deployment detail\nTotals for the selected range per deployment (all selected accounts). Token metrics only have the `ModelDeploymentName` dimension; `AzureOpenAIRequests` also has `ModelName`/`ModelVersion`. Below, pick an **account and deployment** to see tokens per minute (TPM), requests by `StatusCode` and 429s against its limit."
+      }
+    },
+    {
+      "type": 10,
+      "name": "detail-summary",
+      "content": {
+        "chartId": "workbookcf6f696a017d448db2a51e73",
+        "version": "MetricsItem/2.0",
+        "size": 0,
+        "chartType": 0,
+        "resourceType": "microsoft.cognitiveservices/accounts",
+        "metricScope": 0,
+        "resourceParameter": "Resources",
+        "resourceIds": [
+          "{Resources}"
+        ],
+        "timeContextFromParameter": "TimeRange",
+        "metrics": [
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--ProcessedPromptTokens",
+            "aggregation": 1,
+            "splitBy": "ModelDeploymentName",
+            "splitBySortOrder": -1,
+            "splitByLimit": 100,
+            "columnName": "Input tokens"
+          },
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--GeneratedTokens",
+            "aggregation": 1,
+            "splitBy": "ModelDeploymentName",
+            "splitBySortOrder": -1,
+            "splitByLimit": 100,
+            "columnName": "Output tokens"
+          },
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--AzureOpenAIRequests",
+            "aggregation": 1,
+            "splitBy": "ModelDeploymentName",
+            "splitBySortOrder": -1,
+            "splitByLimit": 100,
+            "columnName": "Requests"
+          }
+        ],
+        "title": "Totals per deployment (input, output, requests)",
+        "gridFormatType": 1,
+        "filters": [],
+        "showOpenInMe": true,
+        "gridSettings": {
+          "formatters": [
+            {
+              "columnMatch": "Subscription",
+              "formatter": 5
+            },
+            {
+              "columnMatch": "Metric",
+              "formatter": 1
+            },
+            {
+              "columnMatch": "Aggregation",
+              "formatter": 5
+            },
+            {
+              "columnMatch": "Segment Field",
+              "formatter": 5
+            },
+            {
+              "columnMatch": "Value",
+              "formatter": 1
+            },
+            {
+              "columnMatch": "Timeline",
+              "formatter": 9
+            },
+            {
+              "columnMatch": "Name",
+              "formatter": 13,
+              "formatOptions": {
+                "linkTarget": "Resource"
+              }
+            }
+          ],
+          "rowLimit": 10000
+        }
+      }
+    },
+    {
+      "type": 10,
+      "name": "detail-bymodel",
+      "content": {
+        "chartId": "workbook8952372ac6a4469d8c8dd754",
+        "version": "MetricsItem/2.0",
+        "size": 0,
+        "chartType": 0,
+        "resourceType": "microsoft.cognitiveservices/accounts",
+        "metricScope": 0,
+        "resourceParameter": "Resources",
+        "resourceIds": [
+          "{Resources}"
+        ],
+        "timeContextFromParameter": "TimeRange",
+        "metrics": [
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--AzureOpenAIRequests",
+            "aggregation": 1,
+            "splitBy": "ModelName",
+            "splitBySortOrder": -1,
+            "splitByLimit": 100,
+            "columnName": "Requests"
+          }
+        ],
+        "title": "Requests per model",
+        "gridFormatType": 1,
+        "filters": [],
+        "showOpenInMe": true,
+        "gridSettings": {
+          "formatters": [
+            {
+              "columnMatch": "Subscription",
+              "formatter": 5
+            },
+            {
+              "columnMatch": "Metric",
+              "formatter": 1
+            },
+            {
+              "columnMatch": "Aggregation",
+              "formatter": 5
+            },
+            {
+              "columnMatch": "Segment Field",
+              "formatter": 5
+            },
+            {
+              "columnMatch": "Value",
+              "formatter": 1
+            },
+            {
+              "columnMatch": "Timeline",
+              "formatter": 9
+            },
+            {
+              "columnMatch": "Name",
+              "formatter": 13,
+              "formatOptions": {
+                "linkTarget": "Resource"
+              }
+            }
+          ],
+          "rowLimit": 10000
+        }
+      },
+      "customWidth": "50"
+    },
+    {
+      "type": 10,
+      "name": "detail-429",
+      "content": {
+        "chartId": "workbook1325f60086184db494e2cbe6",
+        "version": "MetricsItem/2.0",
+        "size": 0,
+        "chartType": 0,
+        "resourceType": "microsoft.cognitiveservices/accounts",
+        "metricScope": 0,
+        "resourceParameter": "Resources",
+        "resourceIds": [
+          "{Resources}"
+        ],
+        "timeContextFromParameter": "TimeRange",
+        "metrics": [
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--AzureOpenAIRequests",
+            "aggregation": 1,
+            "splitBy": "ModelDeploymentName",
+            "splitBySortOrder": -1,
+            "splitByLimit": 100,
+            "columnName": "429"
+          }
+        ],
+        "title": "Throttled requests (429) per deployment",
+        "gridFormatType": 1,
+        "filters": [
+          {
+            "key": "StatusCode",
+            "operator": 0,
+            "values": [
+              "429"
+            ]
+          }
+        ],
+        "showOpenInMe": true,
+        "gridSettings": {
+          "formatters": [
+            {
+              "columnMatch": "Subscription",
+              "formatter": 5
+            },
+            {
+              "columnMatch": "Metric",
+              "formatter": 1
+            },
+            {
+              "columnMatch": "Aggregation",
+              "formatter": 5
+            },
+            {
+              "columnMatch": "Segment Field",
+              "formatter": 5
+            },
+            {
+              "columnMatch": "Value",
+              "formatter": 1
+            },
+            {
+              "columnMatch": "Timeline",
+              "formatter": 9
+            },
+            {
+              "columnMatch": "Name",
+              "formatter": 13,
+              "formatOptions": {
+                "linkTarget": "Resource"
+              }
+            }
+          ],
+          "rowLimit": 10000
+        }
+      },
+      "customWidth": "50"
+    },
+    {
+      "type": 9,
+      "name": "detail-params",
+      "content": {
+        "version": "KqlParameterItem/1.0",
+        "style": "pills",
+        "queryType": 1,
+        "resourceType": "microsoft.resourcegraph/resources",
+        "crossComponentResources": [
+          "{Subscriptions}"
+        ],
+        "parameters": [
+          {
+            "id": "13f8e37b-f1e6-4948-a719-15e441ae8959",
+            "version": "KqlParameterItem/1.0",
+            "name": "DetailResource",
+            "label": "Account",
+            "type": 5,
+            "isRequired": true,
+            "multiSelect": false,
+            "queryType": 1,
+            "resourceType": "microsoft.resourcegraph/resources",
+            "crossComponentResources": [
+              "{Subscriptions}"
+            ],
+            "query": "resources\n| where type =~ 'microsoft.cognitiveservices/accounts'\n| where id in~ ({Resources})\n| project value = id, label = name, group = subscriptionId",
+            "typeSettings": {
+              "additionalResourceOptions": [
+                "value::1"
+              ],
+              "showDefault": false
+            },
+            "value": "value::1"
+          },
+          {
+            "id": "6c511642-7dc2-4c70-8fea-6f9fd9ce4c36",
+            "version": "KqlParameterItem/1.0",
+            "name": "Deployment",
+            "label": "Deployment",
+            "type": 2,
+            "isRequired": true,
+            "queryType": 12,
+            "query": "{\"version\": \"ARMEndpoint/1.0\", \"data\": null, \"headers\": [], \"method\": \"GET\", \"path\": \"{DetailResource}/deployments\", \"urlParams\": [{\"key\": \"api-version\", \"value\": \"2024-10-01\"}], \"batchDisabled\": false, \"transformers\": [{\"type\": \"jsonpath\", \"settings\": {\"tablePath\": \"$.value[*]\", \"columns\": [{\"path\": \"$.name\", \"columnid\": \"value\"}, {\"path\": \"$.name\", \"columnid\": \"label\"}]}}]}",
+            "typeSettings": {
+              "additionalResourceOptions": [
+                "value::1"
+              ],
+              "showDefault": false
+            },
+            "value": "value::1"
+          }
+        ]
+      }
+    },
+    {
+      "type": 3,
+      "name": "detail-limits",
+      "content": {
+        "version": "KqlItem/1.0",
+        "title": "Account deployments: model, SKU, capacity and limits",
+        "size": 0,
+        "queryType": 12,
+        "query": "{\"version\": \"ARMEndpoint/1.0\", \"data\": null, \"headers\": [], \"method\": \"GET\", \"path\": \"{DetailResource}/deployments\", \"urlParams\": [{\"key\": \"api-version\", \"value\": \"2024-10-01\"}], \"batchDisabled\": false, \"transformers\": [{\"type\": \"jsonpath\", \"settings\": {\"tablePath\": \"$.value[*]\", \"columns\": [{\"path\": \"$.name\", \"columnid\": \"Deployment\"}, {\"path\": \"$.properties.model.name\", \"columnid\": \"Model\"}, {\"path\": \"$.properties.model.version\", \"columnid\": \"Version\"}, {\"path\": \"$.sku.name\", \"columnid\": \"SKU\"}, {\"path\": \"$.sku.capacity\", \"columnid\": \"Capacity\", \"columnType\": \"long\"}, {\"path\": \"$.properties.rateLimits[?(@.key == 'token')].count\", \"columnid\": \"TPM limit\"}, {\"path\": \"$.properties.rateLimits[?(@.key == 'request')].count\", \"columnid\": \"RPM limit\"}]}}]}",
+        "gridSettings": {
+          "rowLimit": 1000
+        }
+      },
+      "conditionalVisibility": {
+        "parameterName": "DetailResource",
+        "comparison": "isNotEqualTo",
+        "value": null
+      }
+    },
+    {
+      "type": 10,
+      "name": "detail-tokens-PT1M",
+      "content": {
+        "chartId": "workbook827ff937f82d461d9d9e5cb4",
+        "version": "MetricsItem/2.0",
+        "size": 0,
+        "chartType": 2,
+        "resourceType": "microsoft.cognitiveservices/accounts",
+        "metricScope": 0,
+        "resourceParameter": "DetailResource",
+        "resourceIds": [
+          "{DetailResource}"
+        ],
+        "timeContextFromParameter": "TimeRange",
+        "timeGrain": "PT1M",
+        "metrics": [
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--ProcessedPromptTokens",
+            "aggregation": 1,
+            "columnName": "Input"
+          },
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--GeneratedTokens",
+            "aggregation": 1,
+            "columnName": "Output"
+          }
+        ],
+        "filters": [
+          {
+            "key": "ModelDeploymentName",
+            "operator": 0,
+            "values": [
+              "{Deployment}"
+            ]
+          }
+        ],
+        "title": "Deployment tokens: input vs output (sum per interval; at PT1M = TPM) - PT1M",
+        "showOpenInMe": true,
+        "gridSettings": {
+          "rowLimit": 10000
+        }
+      },
+      "customWidth": "50",
+      "conditionalVisibilities": [
+        {
+          "parameterName": "TimeGrain",
+          "comparison": "isEqualTo",
+          "value": "PT1M"
+        },
+        {
+          "parameterName": "DetailResource",
+          "comparison": "isNotEqualTo",
+          "value": null
+        },
+        {
+          "parameterName": "Deployment",
+          "comparison": "isNotEqualTo",
+          "value": null
+        }
+      ]
+    },
+    {
+      "type": 10,
+      "name": "detail-status-PT1M",
+      "content": {
+        "chartId": "workbook8fb9f314113c45a0993168b3",
+        "version": "MetricsItem/2.0",
+        "size": 0,
+        "chartType": 2,
+        "resourceType": "microsoft.cognitiveservices/accounts",
+        "metricScope": 0,
+        "resourceParameter": "DetailResource",
+        "resourceIds": [
+          "{DetailResource}"
+        ],
+        "timeContextFromParameter": "TimeRange",
+        "timeGrain": "PT1M",
+        "metrics": [
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--AzureOpenAIRequests",
+            "aggregation": 1
+          }
+        ],
+        "filters": [
+          {
+            "key": "ModelDeploymentName",
+            "operator": 0,
+            "values": [
+              "{Deployment}"
+            ]
+          }
+        ],
+        "title": "Deployment requests by StatusCode (200, 429, 4xx...) - PT1M",
+        "showOpenInMe": true,
+        "gridSettings": {
+          "rowLimit": 10000
+        },
+        "splitBy": [
+          {
+            "dimension": "StatusCode",
+            "sortOrder": -1
+          }
+        ],
+        "splitBySortOrder": -1,
+        "splitByLimit": 25
+      },
+      "customWidth": "50",
+      "conditionalVisibilities": [
+        {
+          "parameterName": "TimeGrain",
+          "comparison": "isEqualTo",
+          "value": "PT1M"
+        },
+        {
+          "parameterName": "DetailResource",
+          "comparison": "isNotEqualTo",
+          "value": null
+        },
+        {
+          "parameterName": "Deployment",
+          "comparison": "isNotEqualTo",
+          "value": null
+        }
+      ]
+    },
+    {
+      "type": 10,
+      "name": "detail-throttled-PT1M",
+      "content": {
+        "chartId": "workbook06323242ba334a2d8f6aa054",
+        "version": "MetricsItem/2.0",
+        "size": 0,
+        "chartType": 2,
+        "resourceType": "microsoft.cognitiveservices/accounts",
+        "metricScope": 0,
+        "resourceParameter": "DetailResource",
+        "resourceIds": [
+          "{DetailResource}"
+        ],
+        "timeContextFromParameter": "TimeRange",
+        "timeGrain": "PT1M",
+        "metrics": [
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--AzureOpenAIRequests",
+            "aggregation": 1,
+            "columnName": "429"
+          }
+        ],
+        "filters": [
+          {
+            "key": "ModelDeploymentName",
+            "operator": 0,
+            "values": [
+              "{Deployment}"
+            ]
+          },
+          {
+            "key": "StatusCode",
+            "operator": 0,
+            "values": [
+              "429"
+            ]
+          }
+        ],
+        "title": "Deployment throttling (StatusCode 429) - PT1M",
+        "showOpenInMe": true,
+        "gridSettings": {
+          "rowLimit": 10000
+        }
+      },
+      "customWidth": "50",
+      "conditionalVisibilities": [
+        {
+          "parameterName": "TimeGrain",
+          "comparison": "isEqualTo",
+          "value": "PT1M"
+        },
+        {
+          "parameterName": "DetailResource",
+          "comparison": "isNotEqualTo",
+          "value": null
+        },
+        {
+          "parameterName": "Deployment",
+          "comparison": "isNotEqualTo",
+          "value": null
+        }
+      ]
+    },
+    {
+      "type": 10,
+      "name": "detail-ptu-PT1M",
+      "content": {
+        "chartId": "workbook83119544347f46bd9a9169a2",
+        "version": "MetricsItem/2.0",
+        "size": 0,
+        "chartType": 2,
+        "resourceType": "microsoft.cognitiveservices/accounts",
+        "metricScope": 0,
+        "resourceParameter": "DetailResource",
+        "resourceIds": [
+          "{DetailResource}"
+        ],
+        "timeContextFromParameter": "TimeRange",
+        "timeGrain": "PT1M",
+        "metrics": [
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--AzureOpenAIProvisionedManagedUtilizationV2",
+            "aggregation": 3
+          }
+        ],
+        "filters": [
+          {
+            "key": "ModelDeploymentName",
+            "operator": 0,
+            "values": [
+              "{Deployment}"
+            ]
+          }
+        ],
+        "title": "PTU - Deployment Provisioned-managed Utilization V2 (max %) - PT1M",
+        "showOpenInMe": true,
+        "gridSettings": {
+          "rowLimit": 10000
+        }
+      },
+      "customWidth": "50",
+      "conditionalVisibilities": [
+        {
+          "parameterName": "TimeGrain",
+          "comparison": "isEqualTo",
+          "value": "PT1M"
+        },
+        {
+          "parameterName": "DetailResource",
+          "comparison": "isNotEqualTo",
+          "value": null
+        },
+        {
+          "parameterName": "Deployment",
+          "comparison": "isNotEqualTo",
+          "value": null
+        }
+      ]
+    },
+    {
+      "type": 10,
+      "name": "detail-tokens-PT5M",
+      "content": {
+        "chartId": "workbook5c34c024e0d84359922b0b4d",
+        "version": "MetricsItem/2.0",
+        "size": 0,
+        "chartType": 2,
+        "resourceType": "microsoft.cognitiveservices/accounts",
+        "metricScope": 0,
+        "resourceParameter": "DetailResource",
+        "resourceIds": [
+          "{DetailResource}"
+        ],
+        "timeContextFromParameter": "TimeRange",
+        "timeGrain": "PT5M",
+        "metrics": [
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--ProcessedPromptTokens",
+            "aggregation": 1,
+            "columnName": "Input"
+          },
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--GeneratedTokens",
+            "aggregation": 1,
+            "columnName": "Output"
+          }
+        ],
+        "filters": [
+          {
+            "key": "ModelDeploymentName",
+            "operator": 0,
+            "values": [
+              "{Deployment}"
+            ]
+          }
+        ],
+        "title": "Deployment tokens: input vs output (sum per interval; at PT1M = TPM) - PT5M",
+        "showOpenInMe": true,
+        "gridSettings": {
+          "rowLimit": 10000
+        }
+      },
+      "customWidth": "50",
+      "conditionalVisibilities": [
+        {
+          "parameterName": "TimeGrain",
+          "comparison": "isEqualTo",
+          "value": "PT5M"
+        },
+        {
+          "parameterName": "DetailResource",
+          "comparison": "isNotEqualTo",
+          "value": null
+        },
+        {
+          "parameterName": "Deployment",
+          "comparison": "isNotEqualTo",
+          "value": null
+        }
+      ]
+    },
+    {
+      "type": 10,
+      "name": "detail-status-PT5M",
+      "content": {
+        "chartId": "workbooke2369b75f49f48829a0875b0",
+        "version": "MetricsItem/2.0",
+        "size": 0,
+        "chartType": 2,
+        "resourceType": "microsoft.cognitiveservices/accounts",
+        "metricScope": 0,
+        "resourceParameter": "DetailResource",
+        "resourceIds": [
+          "{DetailResource}"
+        ],
+        "timeContextFromParameter": "TimeRange",
+        "timeGrain": "PT5M",
+        "metrics": [
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--AzureOpenAIRequests",
+            "aggregation": 1
+          }
+        ],
+        "filters": [
+          {
+            "key": "ModelDeploymentName",
+            "operator": 0,
+            "values": [
+              "{Deployment}"
+            ]
+          }
+        ],
+        "title": "Deployment requests by StatusCode (200, 429, 4xx...) - PT5M",
+        "showOpenInMe": true,
+        "gridSettings": {
+          "rowLimit": 10000
+        },
+        "splitBy": [
+          {
+            "dimension": "StatusCode",
+            "sortOrder": -1
+          }
+        ],
+        "splitBySortOrder": -1,
+        "splitByLimit": 25
+      },
+      "customWidth": "50",
+      "conditionalVisibilities": [
+        {
+          "parameterName": "TimeGrain",
+          "comparison": "isEqualTo",
+          "value": "PT5M"
+        },
+        {
+          "parameterName": "DetailResource",
+          "comparison": "isNotEqualTo",
+          "value": null
+        },
+        {
+          "parameterName": "Deployment",
+          "comparison": "isNotEqualTo",
+          "value": null
+        }
+      ]
+    },
+    {
+      "type": 10,
+      "name": "detail-throttled-PT5M",
+      "content": {
+        "chartId": "workbookd270f7649e634126bcf34de4",
+        "version": "MetricsItem/2.0",
+        "size": 0,
+        "chartType": 2,
+        "resourceType": "microsoft.cognitiveservices/accounts",
+        "metricScope": 0,
+        "resourceParameter": "DetailResource",
+        "resourceIds": [
+          "{DetailResource}"
+        ],
+        "timeContextFromParameter": "TimeRange",
+        "timeGrain": "PT5M",
+        "metrics": [
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--AzureOpenAIRequests",
+            "aggregation": 1,
+            "columnName": "429"
+          }
+        ],
+        "filters": [
+          {
+            "key": "ModelDeploymentName",
+            "operator": 0,
+            "values": [
+              "{Deployment}"
+            ]
+          },
+          {
+            "key": "StatusCode",
+            "operator": 0,
+            "values": [
+              "429"
+            ]
+          }
+        ],
+        "title": "Deployment throttling (StatusCode 429) - PT5M",
+        "showOpenInMe": true,
+        "gridSettings": {
+          "rowLimit": 10000
+        }
+      },
+      "customWidth": "50",
+      "conditionalVisibilities": [
+        {
+          "parameterName": "TimeGrain",
+          "comparison": "isEqualTo",
+          "value": "PT5M"
+        },
+        {
+          "parameterName": "DetailResource",
+          "comparison": "isNotEqualTo",
+          "value": null
+        },
+        {
+          "parameterName": "Deployment",
+          "comparison": "isNotEqualTo",
+          "value": null
+        }
+      ]
+    },
+    {
+      "type": 10,
+      "name": "detail-ptu-PT5M",
+      "content": {
+        "chartId": "workbooka0ff3ea8b2a34cbda52bf11f",
+        "version": "MetricsItem/2.0",
+        "size": 0,
+        "chartType": 2,
+        "resourceType": "microsoft.cognitiveservices/accounts",
+        "metricScope": 0,
+        "resourceParameter": "DetailResource",
+        "resourceIds": [
+          "{DetailResource}"
+        ],
+        "timeContextFromParameter": "TimeRange",
+        "timeGrain": "PT5M",
+        "metrics": [
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--AzureOpenAIProvisionedManagedUtilizationV2",
+            "aggregation": 3
+          }
+        ],
+        "filters": [
+          {
+            "key": "ModelDeploymentName",
+            "operator": 0,
+            "values": [
+              "{Deployment}"
+            ]
+          }
+        ],
+        "title": "PTU - Deployment Provisioned-managed Utilization V2 (max %) - PT5M",
+        "showOpenInMe": true,
+        "gridSettings": {
+          "rowLimit": 10000
+        }
+      },
+      "customWidth": "50",
+      "conditionalVisibilities": [
+        {
+          "parameterName": "TimeGrain",
+          "comparison": "isEqualTo",
+          "value": "PT5M"
+        },
+        {
+          "parameterName": "DetailResource",
+          "comparison": "isNotEqualTo",
+          "value": null
+        },
+        {
+          "parameterName": "Deployment",
+          "comparison": "isNotEqualTo",
+          "value": null
+        }
+      ]
+    },
+    {
+      "type": 10,
+      "name": "detail-tokens-PT1H",
+      "content": {
+        "chartId": "workbookdb53ebeed7fa4b3fbce728b3",
+        "version": "MetricsItem/2.0",
+        "size": 0,
+        "chartType": 2,
+        "resourceType": "microsoft.cognitiveservices/accounts",
+        "metricScope": 0,
+        "resourceParameter": "DetailResource",
+        "resourceIds": [
+          "{DetailResource}"
+        ],
+        "timeContextFromParameter": "TimeRange",
+        "timeGrain": "PT1H",
+        "metrics": [
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--ProcessedPromptTokens",
+            "aggregation": 1,
+            "columnName": "Input"
+          },
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--GeneratedTokens",
+            "aggregation": 1,
+            "columnName": "Output"
+          }
+        ],
+        "filters": [
+          {
+            "key": "ModelDeploymentName",
+            "operator": 0,
+            "values": [
+              "{Deployment}"
+            ]
+          }
+        ],
+        "title": "Deployment tokens: input vs output (sum per interval; at PT1M = TPM) - PT1H",
+        "showOpenInMe": true,
+        "gridSettings": {
+          "rowLimit": 10000
+        }
+      },
+      "customWidth": "50",
+      "conditionalVisibilities": [
+        {
+          "parameterName": "TimeGrain",
+          "comparison": "isEqualTo",
+          "value": "PT1H"
+        },
+        {
+          "parameterName": "DetailResource",
+          "comparison": "isNotEqualTo",
+          "value": null
+        },
+        {
+          "parameterName": "Deployment",
+          "comparison": "isNotEqualTo",
+          "value": null
+        }
+      ]
+    },
+    {
+      "type": 10,
+      "name": "detail-status-PT1H",
+      "content": {
+        "chartId": "workbookc67a8086fe254decbe3ec089",
+        "version": "MetricsItem/2.0",
+        "size": 0,
+        "chartType": 2,
+        "resourceType": "microsoft.cognitiveservices/accounts",
+        "metricScope": 0,
+        "resourceParameter": "DetailResource",
+        "resourceIds": [
+          "{DetailResource}"
+        ],
+        "timeContextFromParameter": "TimeRange",
+        "timeGrain": "PT1H",
+        "metrics": [
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--AzureOpenAIRequests",
+            "aggregation": 1
+          }
+        ],
+        "filters": [
+          {
+            "key": "ModelDeploymentName",
+            "operator": 0,
+            "values": [
+              "{Deployment}"
+            ]
+          }
+        ],
+        "title": "Deployment requests by StatusCode (200, 429, 4xx...) - PT1H",
+        "showOpenInMe": true,
+        "gridSettings": {
+          "rowLimit": 10000
+        },
+        "splitBy": [
+          {
+            "dimension": "StatusCode",
+            "sortOrder": -1
+          }
+        ],
+        "splitBySortOrder": -1,
+        "splitByLimit": 25
+      },
+      "customWidth": "50",
+      "conditionalVisibilities": [
+        {
+          "parameterName": "TimeGrain",
+          "comparison": "isEqualTo",
+          "value": "PT1H"
+        },
+        {
+          "parameterName": "DetailResource",
+          "comparison": "isNotEqualTo",
+          "value": null
+        },
+        {
+          "parameterName": "Deployment",
+          "comparison": "isNotEqualTo",
+          "value": null
+        }
+      ]
+    },
+    {
+      "type": 10,
+      "name": "detail-throttled-PT1H",
+      "content": {
+        "chartId": "workbook2bb3764348e64c98b5e6e0c1",
+        "version": "MetricsItem/2.0",
+        "size": 0,
+        "chartType": 2,
+        "resourceType": "microsoft.cognitiveservices/accounts",
+        "metricScope": 0,
+        "resourceParameter": "DetailResource",
+        "resourceIds": [
+          "{DetailResource}"
+        ],
+        "timeContextFromParameter": "TimeRange",
+        "timeGrain": "PT1H",
+        "metrics": [
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--AzureOpenAIRequests",
+            "aggregation": 1,
+            "columnName": "429"
+          }
+        ],
+        "filters": [
+          {
+            "key": "ModelDeploymentName",
+            "operator": 0,
+            "values": [
+              "{Deployment}"
+            ]
+          },
+          {
+            "key": "StatusCode",
+            "operator": 0,
+            "values": [
+              "429"
+            ]
+          }
+        ],
+        "title": "Deployment throttling (StatusCode 429) - PT1H",
+        "showOpenInMe": true,
+        "gridSettings": {
+          "rowLimit": 10000
+        }
+      },
+      "customWidth": "50",
+      "conditionalVisibilities": [
+        {
+          "parameterName": "TimeGrain",
+          "comparison": "isEqualTo",
+          "value": "PT1H"
+        },
+        {
+          "parameterName": "DetailResource",
+          "comparison": "isNotEqualTo",
+          "value": null
+        },
+        {
+          "parameterName": "Deployment",
+          "comparison": "isNotEqualTo",
+          "value": null
+        }
+      ]
+    },
+    {
+      "type": 10,
+      "name": "detail-ptu-PT1H",
+      "content": {
+        "chartId": "workbook8a933f3a0e9e481a9db78f6d",
+        "version": "MetricsItem/2.0",
+        "size": 0,
+        "chartType": 2,
+        "resourceType": "microsoft.cognitiveservices/accounts",
+        "metricScope": 0,
+        "resourceParameter": "DetailResource",
+        "resourceIds": [
+          "{DetailResource}"
+        ],
+        "timeContextFromParameter": "TimeRange",
+        "timeGrain": "PT1H",
+        "metrics": [
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--AzureOpenAIProvisionedManagedUtilizationV2",
+            "aggregation": 3
+          }
+        ],
+        "filters": [
+          {
+            "key": "ModelDeploymentName",
+            "operator": 0,
+            "values": [
+              "{Deployment}"
+            ]
+          }
+        ],
+        "title": "PTU - Deployment Provisioned-managed Utilization V2 (max %) - PT1H",
+        "showOpenInMe": true,
+        "gridSettings": {
+          "rowLimit": 10000
+        }
+      },
+      "customWidth": "50",
+      "conditionalVisibilities": [
+        {
+          "parameterName": "TimeGrain",
+          "comparison": "isEqualTo",
+          "value": "PT1H"
+        },
+        {
+          "parameterName": "DetailResource",
+          "comparison": "isNotEqualTo",
+          "value": null
+        },
+        {
+          "parameterName": "Deployment",
+          "comparison": "isNotEqualTo",
+          "value": null
+        }
+      ]
+    },
+    {
+      "type": 1,
+      "name": "quota-intro",
+      "content": {
+        "json": "## Quota by subscription and region\nQuota is assigned per **subscription + region + deployment type + model** (or a shared PTU pool). The table shows the capacity assigned to deployments versus the limit (units; usually 1 unit = 1,000 TPM, check the deployment `rateLimits` for the exact factor). Actual per-minute consumption % against quota is computed by `foundry_token_stats.py` (*Quotas* sheet and `foundry-quota-utilization` CSV), because it requires summing all deployments of the quota minute by minute. Metrics count processed tokens; the rate limiter counts estimated tokens (prompt + max_tokens), so 429s are the direct saturation signal."
+      }
+    },
+    {
+      "type": 9,
+      "name": "quota-params",
+      "content": {
+        "version": "KqlParameterItem/1.0",
+        "parameters": [
+          {
+            "id": "8d473b7f-f274-456d-b56d-1e3f6547d414",
+            "version": "KqlParameterItem/1.0",
+            "name": "QuotaSubscription",
+            "label": "Subscription (quota)",
+            "type": 6,
+            "isRequired": true,
+            "typeSettings": {
+              "additionalResourceOptions": [],
+              "includeAll": false,
+              "showDefault": false
+            },
+            "value": null
+          },
+          {
+            "id": "4da3d59a-9ab5-44be-bcf8-e70cd49aeb24",
+            "version": "KqlParameterItem/1.0",
+            "name": "QuotaLocation",
+            "label": "Region (quota)",
+            "type": 2,
+            "isRequired": true,
+            "queryType": 1,
+            "resourceType": "microsoft.resourcegraph/resources",
+            "crossComponentResources": [
+              "{QuotaSubscription}"
+            ],
+            "query": "resources\n| where type =~ 'microsoft.cognitiveservices/accounts'\n| distinct location\n| order by location asc",
+            "typeSettings": {
+              "additionalResourceOptions": [],
+              "showDefault": false
+            },
+            "value": null
+          }
+        ],
+        "style": "pills",
+        "queryType": 1,
+        "resourceType": "microsoft.resourcegraph/resources"
+      }
+    },
+    {
+      "type": 3,
+      "name": "quota-usages",
+      "content": {
+        "version": "KqlItem/1.0",
+        "title": "Assigned quota vs limit (quotas in use only)",
+        "size": 0,
+        "queryType": 12,
+        "query": "{\"version\": \"ARMEndpoint/1.0\", \"data\": null, \"headers\": [], \"method\": \"GET\", \"path\": \"/subscriptions/{QuotaSubscription:id}/providers/Microsoft.CognitiveServices/locations/{QuotaLocation}/usages\", \"urlParams\": [{\"key\": \"api-version\", \"value\": \"2024-10-01\"}], \"batchDisabled\": false, \"transformers\": [{\"type\": \"jsonpath\", \"settings\": {\"tablePath\": \"$.value[?(@.currentValue > 0)]\", \"columns\": [{\"path\": \"$.name.value\", \"columnid\": \"Quota\"}, {\"path\": \"$.currentValue\", \"columnid\": \"Assigned\", \"columnType\": \"long\"}, {\"path\": \"$.limit\", \"columnid\": \"Limit\", \"columnType\": \"long\"}, {\"path\": \"$.unit\", \"columnid\": \"Unit\"}]}}]}",
+        "gridSettings": {
+          "rowLimit": 1000,
+          "sortBy": [
+            {
+              "itemKey": "Assigned",
+              "sortOrder": 2
+            }
+          ]
+        }
+      },
+      "conditionalVisibilities": [
+        {
+          "parameterName": "QuotaSubscription",
+          "comparison": "isNotEqualTo",
+          "value": null
+        },
+        {
+          "parameterName": "QuotaLocation",
+          "comparison": "isNotEqualTo",
+          "value": null
+        }
+      ]
+    }
+  ],
+  "fallbackResourceIds": [
+    "Azure Monitor"
+  ],
+  "$schema": "https://github.com/Microsoft/Application-Insights-Workbooks/blob/master/schema/workbook.json"
+}
