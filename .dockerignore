@@ -1,0 +1,10 @@
+output/
+.git/
+.vscode/
+.idea/
+**/__pycache__/
+*.xlsx
+*.log
+.env
+.env.*
+.azure/

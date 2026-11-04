@@ -1,6 +1,7 @@
 # Extraction and report outputs (may contain tenant/subscription/resource data)
 output/
 *.csv
+!prices.example.csv
 *.xlsx
 *.log
 run.json

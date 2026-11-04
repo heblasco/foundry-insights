@@ -833,7 +833,7 @@
       "type": 1,
       "name": "detail-intro",
       "content": {
-        "json": "## Per model / deployment detail\nTotals for the selected range per deployment (all selected accounts). Token metrics only have the `ModelDeploymentName` dimension; `AzureOpenAIRequests` also has `ModelName`/`ModelVersion`. Below, pick an **account and deployment** to see tokens per minute (TPM), requests by `StatusCode` and 429s against its limit."
+        "json": "## Per model / deployment detail\nTotals for the selected range per deployment (all selected accounts). Token metrics only have the `ModelDeploymentName` dimension; `AzureOpenAIRequests` also has `ModelName`/`ModelVersion`. Below, pick an **account and deployment** to see tokens per minute (TPM), requests by `StatusCode` (429, other 4xx, 5xx) against its limit, latency (time to response / time to last token) and availability. Latency metrics are only emitted for minutes with traffic; empty charts on idle deployments are expected."
       }
     },
     {
@@ -1394,6 +1394,130 @@
     },
     {
       "type": 10,
+      "name": "detail-latency-PT1M",
+      "content": {
+        "chartId": "workbook8e0565bafb6545aba25ee980",
+        "version": "MetricsItem/2.0",
+        "size": 0,
+        "chartType": 2,
+        "resourceType": "microsoft.cognitiveservices/accounts",
+        "metricScope": 0,
+        "resourceParameter": "DetailResource",
+        "resourceIds": [
+          "{DetailResource}"
+        ],
+        "timeContextFromParameter": "TimeRange",
+        "timeGrain": "PT1M",
+        "metrics": [
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--AzureOpenAITimeToResponse",
+            "aggregation": 4
+          },
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--AzureOpenAITTLTInMS",
+            "aggregation": 4
+          }
+        ],
+        "filters": [
+          {
+            "key": "ModelDeploymentName",
+            "operator": 0,
+            "values": [
+              "{Deployment}"
+            ]
+          }
+        ],
+        "title": "Deployment latency: time to response and time to last token (avg ms per interval) - PT1M",
+        "showOpenInMe": true,
+        "gridSettings": {
+          "rowLimit": 10000
+        }
+      },
+      "customWidth": "50",
+      "conditionalVisibilities": [
+        {
+          "parameterName": "TimeGrain",
+          "comparison": "isEqualTo",
+          "value": "PT1M"
+        },
+        {
+          "parameterName": "DetailResource",
+          "comparison": "isNotEqualTo",
+          "value": null
+        },
+        {
+          "parameterName": "Deployment",
+          "comparison": "isNotEqualTo",
+          "value": null
+        }
+      ]
+    },
+    {
+      "type": 10,
+      "name": "detail-avail-PT1M",
+      "content": {
+        "chartId": "workbook79d697a2fbdf4a748699c91a",
+        "version": "MetricsItem/2.0",
+        "size": 0,
+        "chartType": 2,
+        "resourceType": "microsoft.cognitiveservices/accounts",
+        "metricScope": 0,
+        "resourceParameter": "DetailResource",
+        "resourceIds": [
+          "{DetailResource}"
+        ],
+        "timeContextFromParameter": "TimeRange",
+        "timeGrain": "PT1M",
+        "metrics": [
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--AzureOpenAIAvailabilityRate",
+            "aggregation": 4
+          },
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--AzureOpenAITokenPerSecond",
+            "aggregation": 4
+          }
+        ],
+        "filters": [
+          {
+            "key": "ModelDeploymentName",
+            "operator": 0,
+            "values": [
+              "{Deployment}"
+            ]
+          }
+        ],
+        "title": "Deployment availability rate (avg %) and tokens per second (avg) - PT1M",
+        "showOpenInMe": true,
+        "gridSettings": {
+          "rowLimit": 10000
+        }
+      },
+      "customWidth": "50",
+      "conditionalVisibilities": [
+        {
+          "parameterName": "TimeGrain",
+          "comparison": "isEqualTo",
+          "value": "PT1M"
+        },
+        {
+          "parameterName": "DetailResource",
+          "comparison": "isNotEqualTo",
+          "value": null
+        },
+        {
+          "parameterName": "Deployment",
+          "comparison": "isNotEqualTo",
+          "value": null
+        }
+      ]
+    },
+    {
+      "type": 10,
       "name": "detail-tokens-PT5M",
       "content": {
         "chartId": "workbook5c34c024e0d84359922b0b4d",
@@ -1645,6 +1769,130 @@
     },
     {
       "type": 10,
+      "name": "detail-latency-PT5M",
+      "content": {
+        "chartId": "workbookdb15518da4a741aaa50a88b6",
+        "version": "MetricsItem/2.0",
+        "size": 0,
+        "chartType": 2,
+        "resourceType": "microsoft.cognitiveservices/accounts",
+        "metricScope": 0,
+        "resourceParameter": "DetailResource",
+        "resourceIds": [
+          "{DetailResource}"
+        ],
+        "timeContextFromParameter": "TimeRange",
+        "timeGrain": "PT5M",
+        "metrics": [
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--AzureOpenAITimeToResponse",
+            "aggregation": 4
+          },
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--AzureOpenAITTLTInMS",
+            "aggregation": 4
+          }
+        ],
+        "filters": [
+          {
+            "key": "ModelDeploymentName",
+            "operator": 0,
+            "values": [
+              "{Deployment}"
+            ]
+          }
+        ],
+        "title": "Deployment latency: time to response and time to last token (avg ms per interval) - PT5M",
+        "showOpenInMe": true,
+        "gridSettings": {
+          "rowLimit": 10000
+        }
+      },
+      "customWidth": "50",
+      "conditionalVisibilities": [
+        {
+          "parameterName": "TimeGrain",
+          "comparison": "isEqualTo",
+          "value": "PT5M"
+        },
+        {
+          "parameterName": "DetailResource",
+          "comparison": "isNotEqualTo",
+          "value": null
+        },
+        {
+          "parameterName": "Deployment",
+          "comparison": "isNotEqualTo",
+          "value": null
+        }
+      ]
+    },
+    {
+      "type": 10,
+      "name": "detail-avail-PT5M",
+      "content": {
+        "chartId": "workbook1094060cbca945ffa14ff46a",
+        "version": "MetricsItem/2.0",
+        "size": 0,
+        "chartType": 2,
+        "resourceType": "microsoft.cognitiveservices/accounts",
+        "metricScope": 0,
+        "resourceParameter": "DetailResource",
+        "resourceIds": [
+          "{DetailResource}"
+        ],
+        "timeContextFromParameter": "TimeRange",
+        "timeGrain": "PT5M",
+        "metrics": [
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--AzureOpenAIAvailabilityRate",
+            "aggregation": 4
+          },
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--AzureOpenAITokenPerSecond",
+            "aggregation": 4
+          }
+        ],
+        "filters": [
+          {
+            "key": "ModelDeploymentName",
+            "operator": 0,
+            "values": [
+              "{Deployment}"
+            ]
+          }
+        ],
+        "title": "Deployment availability rate (avg %) and tokens per second (avg) - PT5M",
+        "showOpenInMe": true,
+        "gridSettings": {
+          "rowLimit": 10000
+        }
+      },
+      "customWidth": "50",
+      "conditionalVisibilities": [
+        {
+          "parameterName": "TimeGrain",
+          "comparison": "isEqualTo",
+          "value": "PT5M"
+        },
+        {
+          "parameterName": "DetailResource",
+          "comparison": "isNotEqualTo",
+          "value": null
+        },
+        {
+          "parameterName": "Deployment",
+          "comparison": "isNotEqualTo",
+          "value": null
+        }
+      ]
+    },
+    {
+      "type": 10,
       "name": "detail-tokens-PT1H",
       "content": {
         "chartId": "workbookdb53ebeed7fa4b3fbce728b3",
@@ -1870,6 +2118,130 @@
           }
         ],
         "title": "PTU - Deployment Provisioned-managed Utilization V2 (max %) - PT1H",
+        "showOpenInMe": true,
+        "gridSettings": {
+          "rowLimit": 10000
+        }
+      },
+      "customWidth": "50",
+      "conditionalVisibilities": [
+        {
+          "parameterName": "TimeGrain",
+          "comparison": "isEqualTo",
+          "value": "PT1H"
+        },
+        {
+          "parameterName": "DetailResource",
+          "comparison": "isNotEqualTo",
+          "value": null
+        },
+        {
+          "parameterName": "Deployment",
+          "comparison": "isNotEqualTo",
+          "value": null
+        }
+      ]
+    },
+    {
+      "type": 10,
+      "name": "detail-latency-PT1H",
+      "content": {
+        "chartId": "workbookc4a086c4349c4552acfd21f0",
+        "version": "MetricsItem/2.0",
+        "size": 0,
+        "chartType": 2,
+        "resourceType": "microsoft.cognitiveservices/accounts",
+        "metricScope": 0,
+        "resourceParameter": "DetailResource",
+        "resourceIds": [
+          "{DetailResource}"
+        ],
+        "timeContextFromParameter": "TimeRange",
+        "timeGrain": "PT1H",
+        "metrics": [
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--AzureOpenAITimeToResponse",
+            "aggregation": 4
+          },
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--AzureOpenAITTLTInMS",
+            "aggregation": 4
+          }
+        ],
+        "filters": [
+          {
+            "key": "ModelDeploymentName",
+            "operator": 0,
+            "values": [
+              "{Deployment}"
+            ]
+          }
+        ],
+        "title": "Deployment latency: time to response and time to last token (avg ms per interval) - PT1H",
+        "showOpenInMe": true,
+        "gridSettings": {
+          "rowLimit": 10000
+        }
+      },
+      "customWidth": "50",
+      "conditionalVisibilities": [
+        {
+          "parameterName": "TimeGrain",
+          "comparison": "isEqualTo",
+          "value": "PT1H"
+        },
+        {
+          "parameterName": "DetailResource",
+          "comparison": "isNotEqualTo",
+          "value": null
+        },
+        {
+          "parameterName": "Deployment",
+          "comparison": "isNotEqualTo",
+          "value": null
+        }
+      ]
+    },
+    {
+      "type": 10,
+      "name": "detail-avail-PT1H",
+      "content": {
+        "chartId": "workbook68110b8666584635be12edc9",
+        "version": "MetricsItem/2.0",
+        "size": 0,
+        "chartType": 2,
+        "resourceType": "microsoft.cognitiveservices/accounts",
+        "metricScope": 0,
+        "resourceParameter": "DetailResource",
+        "resourceIds": [
+          "{DetailResource}"
+        ],
+        "timeContextFromParameter": "TimeRange",
+        "timeGrain": "PT1H",
+        "metrics": [
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--AzureOpenAIAvailabilityRate",
+            "aggregation": 4
+          },
+          {
+            "namespace": "microsoft.cognitiveservices/accounts",
+            "metric": "microsoft.cognitiveservices/accounts--AzureOpenAITokenPerSecond",
+            "aggregation": 4
+          }
+        ],
+        "filters": [
+          {
+            "key": "ModelDeploymentName",
+            "operator": 0,
+            "values": [
+              "{Deployment}"
+            ]
+          }
+        ],
+        "title": "Deployment availability rate (avg %) and tokens per second (avg) - PT1H",
         "showOpenInMe": true,
         "gridSettings": {
           "rowLimit": 10000

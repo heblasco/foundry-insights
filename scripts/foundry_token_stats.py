@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import sys
 from pathlib import Path
 
@@ -52,6 +53,15 @@ TOKEN_METRICS = ("ProcessedPromptTokens", "GeneratedTokens")
 DERIVED = "TotalTokens(derived)"
 UTIL = "AzureOpenAIProvisionedManagedUtilizationV2"
 THROTTLED = "ThrottledRequests(429)"
+CLIENT_ERR = "ClientErrors(4xx)"
+SERVER_ERR = "ServerErrors(5xx)"
+TTR = "AzureOpenAITimeToResponse"
+TTLT = "AzureOpenAITTLTInMS"
+TPS = "AzureOpenAITokenPerSecond"
+AVAIL = "AzureOpenAIAvailabilityRate"
+LATENCY_METRICS = (TTR, TTLT, TPS, AVAIL)
+REQUEST_METRICS = ("AzureOpenAIRequests", THROTTLED, CLIENT_ERR, SERVER_ERR)
+MINUTES_PER_MONTH = 30 * 24 * 60
 EXCEL_MAX_ROWS = 1_000_000
 DEP_COLS = {
     "TenantId": "VARCHAR", "SubscriptionId": "VARCHAR", "SubscriptionName": "VARCHAR", "Region": "VARCHAR",
@@ -77,6 +87,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--excel", action="store_true", help=argparse.SUPPRESS)  # kept for compatibility (Excel is the default)
     p.add_argument("--top-n", type=int, default=10, help=argparse.SUPPRESS)  # deprecated no-op (Excel has no charts)
     p.add_argument("--db", default=":memory:", help="DuckDB database file (use a file for very large datasets)")
+    p.add_argument("--prices", help="CSV with list prices per 1M tokens (see prices.example.csv); overrides --fetch-prices")
+    p.add_argument("--fetch-prices", action="store_true",
+                   help="Get candidate PAYG prices from the public Azure Retail Prices API (exact matches only)")
+    p.add_argument("--currency", default="USD", help="Currency for --fetch-prices (default USD)")
     return p.parse_args()
 
 
@@ -175,8 +189,13 @@ def build(con: duckdb.DuckDBPyConnection) -> None:
         GROUP BY rid, ts, dep, ver, region, model
         """
     )
+    # Latency metrics are 1-minute averages/maxima: 0 ms or 0 tokens/s in a minute with requests is a missing
+    # sample, not a measurement. 0 % availability is real and kept.
+    con.execute(f"DELETE FROM pts WHERE metric IN ('{TTR}', '{TTLT}', '{TPS}') AND v = 0")
     call_of = (f"CASE WHEN metric IN {TOKEN_METRICS} OR metric = '{DERIVED}' THEN 'Tokens' "
-               f"WHEN metric IN ('AzureOpenAIRequests', '{THROTTLED}') THEN 'Requests' ELSE 'PtuUtilization' END")
+               f"WHEN metric IN {REQUEST_METRICS} THEN 'Requests' "
+               f"WHEN metric IN {LATENCY_METRICS} THEN 'Latency' "
+               f"WHEN metric = '{UTIL}' THEN 'PtuUtilization' ELSE 'Unknown' END")
     k_dep = key("D", "rid", "region", "dep", "model", "ver", "metric", "agg")
     k_mr = key("MR", "model", "ver", "region", "metric")
     k_m = key("M", "model", "metric")
@@ -260,7 +279,7 @@ def build(con: duckdb.DuckDBPyConnection) -> None:
         """
         CREATE TABLE rcov AS
         SELECT DISTINCT m.rid, m.Call AS call, seg.s
-        FROM seg JOIN manifest m ON m.Status = 'Success' AND m.cs <= seg.s AND seg.e <= m.ce
+        FROM seg JOIN manifest m ON m.Status IN ('Success', 'NotSupported') AND m.cs <= seg.s AND seg.e <= m.ce
         """
     )
     con.execute(
@@ -337,8 +356,10 @@ def compute_stats(con: duckdb.DuckDBPyConnection, window_minutes: int):
         -- Groups whose usage fell only in uncovered segments are kept (k = 0) so they stay visible.
         SELECT g.*, gm.cov, gm.any_truncated, coalesce(s.k, 0) AS k, coalesce(s.s, 0) AS s, s.mx, s.mx_ts,
                s.first_ts, s.last_ts, m.mode,
-               greatest(coalesce(s.k, 0), CASE m.mode WHEN 'FullWindow' THEN gm.cov
-                                                      WHEN 'Lifetime' THEN coalesce(l.life, 0)
+               -- Latency/availability are averages of minutes with requests: never zero-filled.
+               greatest(coalesce(s.k, 0), CASE WHEN g.call = 'Latency' THEN coalesce(s.k, 0)
+                                                      WHEN m.mode = 'FullWindow' THEN gm.cov
+                                                      WHEN m.mode = 'Lifetime' THEN coalesce(l.life, 0)
                                                       ELSE coalesce(s.k, 0) END) AS n
         FROM groups g JOIN gmeta gm USING (gid) LEFT JOIN gstats s USING (gid) LEFT JOIN life l USING (gid)
         CROSS JOIN (VALUES ('FullWindow'), ('Lifetime'), ('Active')) AS m(mode)
@@ -422,17 +443,19 @@ def _pivot(full, level: str, keys: list[str]):
     f = full[full["Level"] == level]
     spec = [
         (DERIVED, "Tokens", ["P95", "P99", "Max", "MaxTimestamp", "CompletenessPct"]),
-        ("ProcessedPromptTokens", "Input", ["P99", "Max"]),
-        ("GeneratedTokens", "Output", ["P99", "Max"]),
-        ("AzureOpenAIRequests", "Requests", ["P99", "Max"]),
+        ("ProcessedPromptTokens", "Input", ["P99", "Max", "Sum"]),
+        ("GeneratedTokens", "Output", ["P99", "Max", "Sum"]),
+        ("AzureOpenAIRequests", "Requests", ["P99", "Max", "Sum"]),
         (THROTTLED, "Throttled429", ["Sum", "ActiveMinutes"]),
+        (CLIENT_ERR, "Errors4xx", ["Sum"]),
+        (SERVER_ERR, "Errors5xx", ["Sum"]),
     ]
     out = None
     for metric, prefix, cols in spec:
         m = f[f["Metric"] == metric][keys + cols].rename(columns={c: f"{prefix}_{c}" for c in cols})
         out = m if out is None else out.merge(m, on=keys, how="outer")
-    # Sparse extraction emits no 429 rows when there was no throttling: zero, not unknown, if requests were covered.
-    for c in ("Throttled429_Sum", "Throttled429_ActiveMinutes"):
+    # Sparse extraction emits no 429/4xx/5xx rows when there were none: zero, not unknown, if requests were covered.
+    for c in ("Throttled429_Sum", "Throttled429_ActiveMinutes", "Errors4xx_Sum", "Errors5xx_Sum"):
         out[c] = out[c].where(out[c].notna() | out["Requests_Max"].isna(), 0)
     return out
 
@@ -442,7 +465,7 @@ def _pct(num, den):
     return (100.0 * num / den.where(den > 0)).round(2).replace([np.inf, -np.inf], np.nan)
 
 
-def limit_reports(con: duckdb.DuckDBPyConnection, stats):
+def limit_reports(con: duckdb.DuckDBPyConnection, stats, window_minutes: int):
     """Per-minute consumption vs deployment rate limits and vs subscription/region quota."""
     full = stats[stats["Mode"] == "FullWindow"]
     deps = con.execute("SELECT * FROM deps").df()
@@ -469,10 +492,13 @@ def limit_reports(con: duckdb.DuckDBPyConnection, stats):
     dep_cols = ["SubscriptionName", "Region", "ResourceName", "DeploymentName", "ModelName", "ModelVersion", "DeploymentSku",
                 "Capacity", "TokensPerMinuteLimit", "RequestsPerMinuteLimit", "QuotaName",
                 "Tokens_P95", "Tokens_P99", "Tokens_Max", "Tokens_MaxTimestamp", "PctOfTPM_P95", "PctOfTPM_P99", "PctOfTPM_Max",
-                "Input_P99", "Input_Max", "Output_P99", "Output_Max",
-                "Requests_P99", "Requests_Max", "PctOfRPM_P99", "PctOfRPM_Max",
-                "Throttled429_Sum", "Throttled429_ActiveMinutes", "Tokens_CompletenessPct", "ResourceId"]
+                "Input_P99", "Input_Max", "Input_Sum", "Output_P99", "Output_Max", "Output_Sum",
+                "Requests_P99", "Requests_Max", "Requests_Sum", "PctOfRPM_P99", "PctOfRPM_Max",
+                "Throttled429_Sum", "Throttled429_ActiveMinutes", "Errors4xx_Sum", "Errors5xx_Sum",
+                "Tokens_CompletenessPct", "ResourceId"]
     dep = dep[dep_cols].sort_values(["PctOfTPM_Max", "Tokens_Max"], ascending=False, na_position="last")
+    dep = dep.reset_index(drop=True)
+    dep = add_status(con, dep, window_minutes)
 
     # Quota: sum of all deployments sharing a subscription/region quota, per minute, vs the quota limit.
     # Capacity units are converted to TPM/RPM with the ratio observed on the deployments themselves.
@@ -513,6 +539,242 @@ def limit_reports(con: duckdb.DuckDBPyConnection, stats):
     return dep, q
 
 
+def add_status(con: duckdb.DuckDBPyConnection, dep, window_minutes: int):
+    """Data status per deployment from manifest coverage (Success/NotSupported, idle pre-flight included).
+
+    'No traffic (confirmed)' requires every minute of the window to be covered for both the Tokens and the
+    Requests calls of the resource; absence of metrics alone is reported as 'No data (incomplete coverage)'.
+    """
+    cov = con.execute(
+        """
+        SELECT rid, call, sum(date_diff('minute', seg.s, seg.e)) AS m
+        FROM rcov JOIN seg USING (s) WHERE call IN ('Tokens', 'Requests') GROUP BY rid, call
+        """
+    ).df()
+    piv = cov.pivot_table(index="rid", columns="call", values="m", aggfunc="sum")
+    rid = dep["ResourceId"].str.lower()
+    for call in ("Tokens", "Requests"):
+        s = piv[call] if call in piv.columns else None
+        dep[f"{call}CoveragePct"] = (100.0 * rid.map(s).fillna(0) / window_minutes).round(2) if s is not None else 0.0
+
+    ptu = dep["DeploymentSku"].fillna("").str.contains("Provisioned")
+    no_tpm = dep["TokensPerMinuteLimit"].isna() & ~ptu
+    unmapped = dep["QuotaName"].fillna("").str.startswith("Unmapped")
+    no_data = dep["Tokens_Max"].isna() & dep["Requests_Max"].isna()
+    full_cov = dep[["TokensCoveragePct", "RequestsCoveragePct"]].min(axis=1) >= 100
+    st = dep["Tokens_Max"].isna().map({True: "Token metric not available", False: "With metrics"})
+    st[no_tpm & ~dep["Tokens_Max"].isna()] = "No TPM limit (RPM only)"
+    st[~full_cov] = "Incomplete coverage"
+    st[no_data & full_cov] = "No traffic (confirmed)"
+    st[no_data & ~full_cov] = "No data (incomplete coverage)"
+    st[unmapped] = "Deployment deleted (Unmapped)"
+    dep["DataStatus"] = st
+    return dep
+
+
+def latency_summary(con: duckdb.DuckDBPyConnection):
+    """Per deployment: P95 of the 1-minute average TTFT/TTLT (minutes with requests only), availability min/avg.
+    Minutes with several series (e.g. model version change) are first collapsed to one conservative value:
+    the worst latency, the lowest availability and the average tokens/s."""
+    return con.execute(
+        f"""
+        WITH m AS (
+            SELECT rid, dep, ts, metric,
+                   CASE WHEN metric = '{AVAIL}' THEN min(v) WHEN metric = '{TPS}' THEN avg(v) ELSE max(v) END AS v
+            FROM pts WHERE metric IN {LATENCY_METRICS} AND agg = 'Average'
+            GROUP BY rid, dep, ts, metric
+        )
+        SELECT rid, dep AS DeploymentName,
+               quantile_disc(v, 0.95) FILTER (WHERE metric = '{TTR}') AS TTR_P95,
+               quantile_disc(v, 0.95) FILTER (WHERE metric = '{TTLT}') AS TTLT_P95,
+               quantile_disc(v, 0.50) FILTER (WHERE metric = '{TPS}') AS TPS_P50,
+               min(v) FILTER (WHERE metric = '{AVAIL}') AS Avail_Min,
+               avg(v) FILTER (WHERE metric = '{AVAIL}') AS Avail_Avg,
+               count(DISTINCT ts) FILTER (WHERE metric = '{AVAIL}') AS LatencyMinutes
+        FROM m GROUP BY rid, dep
+        """
+    ).df()
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Prices (list-price PAYG estimate)
+# ---------------------------------------------------------------------------------------------------------------
+PRICE_COLS = ["Model", "DeploymentType", "Region", "InputPer1M", "OutputPer1M", "Currency", "Source"]
+RETAIL_API = "https://prices.azure.com/api/retail/prices"
+_EXCLUDE = re.compile(r"\b(cd|cached|cache|batch|pp|longco|shortco|flex|ft|fine|tuning|training|hosting|hosted|grdr|"
+                      r"realtime|audio|image|img|vision|embedding|aud)\b", re.I)
+_DIR = [("Input", re.compile(r"\b(inp|input)\b", re.I)), ("Output", re.compile(r"\b(outp|opt|output|out)\b", re.I))]
+_TYPE = [("DataZone", re.compile(r"\b(data\s*zone|dzone|dz)\b", re.I)), ("Global", re.compile(r"\b(glbl|gl|global)\b", re.I)),
+         ("Regional", re.compile(r"\b(regnl|rgnl|regional)\b", re.I))]
+
+
+def norm_model(s) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(s or "").lower())
+
+
+def deployment_type(sku) -> str | None:
+    s = str(sku or "")
+    if "Provisioned" in s or "Batch" in s:
+        return None
+    if s.startswith("DataZone"):
+        return "DataZone"
+    if s.startswith("Global"):
+        return "Global"
+    if s == "Standard":
+        return "Regional"
+    return None
+
+
+def parse_meter(item: dict):
+    """(model_key, type, direction, price_per_1M) for unambiguous token meters, else None. Never guesses."""
+    name = item.get("meterName") or ""
+    if _EXCLUDE.search(name.replace("-", " ")):
+        return None
+    words = name.replace("-", " ")
+    dirs = [d for d, rx in _DIR if rx.search(words)]
+    types = [t for t, rx in _TYPE if rx.search(words)]
+    if len(dirs) != 1 or len(types) != 1:
+        return None
+    m = re.search(r"(\d+)\s*([KM])", item.get("unitOfMeasure") or "", re.I)
+    if not m:
+        return None
+    per = float(m.group(1)) * (1_000 if m.group(2).upper() == "K" else 1_000_000)
+    first = min(rx.search(words).start() for _, rx in _DIR if rx.search(words))
+    prefix = words[:first].strip()
+    if not prefix:
+        return None
+    # Meters like "5.4 inp Gl" carry the family only in productName ("Azure OpenAI GPT5").
+    if prefix[0].isdigit() and re.search(r"\bGPT", item.get("productName") or ""):
+        prefix = "gpt " + prefix
+    return norm_model(prefix), types[0], dirs[0], float(item["retailPrice"]) * 1_000_000 / per
+
+
+def fetch_prices(regions: list[str], currency: str):
+    """Candidate prices from the Azure Retail Prices API (public, unauthenticated). Ambiguous meters are dropped."""
+    import urllib.parse
+    import urllib.request
+    import pandas as pd
+    rows = []
+    for region in sorted({r for r in regions if r}):
+        flt = f"serviceName eq 'Foundry Models' and armRegionName eq '{region}' and type eq 'Consumption'"
+        url = f"{RETAIL_API}?currencyCode='{currency}'&$filter={urllib.parse.quote(flt)}"
+        while url:
+            with urllib.request.urlopen(url, timeout=60) as r:
+                page = json.loads(r.read().decode("utf-8"))
+            for it in page.get("Items", []):
+                p = parse_meter(it)
+                if p:
+                    rows.append({"key": p[0], "DeploymentType": p[1], "dir": p[2], "price": p[3], "Region": region,
+                                 "Currency": it.get("currencyCode"), "meter": it.get("meterName"),
+                                 "eff": it.get("effectiveStartDate", "")})
+            url = page.get("NextPageLink")
+    df = pd.DataFrame(rows, columns=["key", "DeploymentType", "dir", "price", "Region", "Currency", "meter", "eff"])
+    if df.empty:
+        return df
+    # Latest effective price per key; several distinct prices for the same key = ambiguous -> dropped.
+    df = df.sort_values("eff").groupby(["key", "DeploymentType", "dir", "Region", "eff"], as_index=False).agg(
+        price=("price", lambda x: x.iloc[0] if x.nunique() == 1 else math.nan), meter=("meter", "first"),
+        Currency=("Currency", "first"))
+    df = df.groupby(["key", "DeploymentType", "dir", "Region"], as_index=False).last()
+    return df.dropna(subset=["price"])
+
+
+def resolve_prices(dep, prices_file: str | None, fetch: bool, currency: str, out: Path, ts: str):
+    """Attach InputPer1M/OutputPer1M per deployment. User file wins; fetched candidates only on exact model match."""
+    import pandas as pd
+    d = dep.assign(_key=dep["ModelName"].map(norm_model), _type=dep["DeploymentSku"].map(deployment_type),
+                   _region=dep["Region"].fillna("").str.lower())
+    d["InputPer1M"] = math.nan
+    d["OutputPer1M"] = math.nan
+    d["Currency"] = None
+    d["PriceSource"] = None
+    if fetch:
+        cand = fetch_prices(d["_region"].unique().tolist(), currency)
+        if len(cand):
+            wide = cand.pivot_table(index=["key", "DeploymentType", "Region"], columns="dir", values="price",
+                                    aggfunc="first").reset_index()
+            meters = cand.pivot_table(index=["key", "DeploymentType", "Region"], columns="dir", values="meter",
+                                      aggfunc="first").reset_index()
+            wide = wide.merge(meters, on=["key", "DeploymentType", "Region"], suffixes=("", "Meter"))
+            for c in ("Input", "Output", "InputMeter", "OutputMeter"):
+                if c not in wide.columns:
+                    wide[c] = None
+            hit = d[["_key", "_type", "_region", "ModelName"]].drop_duplicates().merge(
+                wide, left_on=["_key", "_type", "_region"], right_on=["key", "DeploymentType", "Region"])
+            cand_out = hit.rename(columns={"Input": "InputPer1M", "Output": "OutputPer1M"}).assign(
+                Model=hit["ModelName"], Currency=currency, Source="RetailAPI (candidate, review)")
+            cand_out[PRICE_COLS + ["InputMeter", "OutputMeter"]].to_csv(out / f"prices-candidates_{ts}.csv", index=False)
+            for c, s in (("InputPer1M", "Input"), ("OutputPer1M", "Output")):
+                m = d.merge(wide, left_on=["_key", "_type", "_region"], right_on=["key", "DeploymentType", "Region"],
+                            how="left")[s]
+                d[c] = m.values
+            d.loc[d["InputPer1M"].notna() | d["OutputPer1M"].notna(), ["Currency", "PriceSource"]] = [currency, "RetailAPI"]
+    if prices_file:
+        p = pd.read_csv(prices_file, dtype=str).fillna("")
+        missing = set(PRICE_COLS[:5]) - set(p.columns)
+        if missing:
+            sys.exit(f"{prices_file}: missing columns {sorted(missing)} (expected {PRICE_COLS})")
+        for r in p.itertuples():
+            if not (str(r.InputPer1M).strip() or str(r.OutputPer1M).strip()):
+                continue
+            sel =  (d["_key"] == norm_model(r.Model)) & (d["_type"] == r.DeploymentType) & \
+                  ((r.Region in ("", "*")) | (d["_region"] == str(r.Region).lower()))
+            for c in ("InputPer1M", "OutputPer1M"):
+                v = getattr(r, c)
+                if str(v).strip():
+                    d.loc[sel, c] = float(v)
+            d.loc[sel, "Currency"] = getattr(r, "Currency", "") or currency
+            d.loc[sel, "PriceSource"] = "File"
+    return d.drop(columns=["_key", "_type", "_region"])
+
+
+def add_costs(dep, window_minutes: int):
+    cov_min = dep["TokensCoveragePct"].fillna(0) / 100.0 * window_minutes
+    dep["InputCost"] = dep["Input_Sum"].fillna(0) / 1e6 * dep["InputPer1M"]
+    dep["OutputCost"] = dep["Output_Sum"].fillna(0) / 1e6 * dep["OutputPer1M"]
+    dep["EstCost"] = dep["InputCost"] + dep["OutputCost"]
+    dep["EstMonthlyCost"] = dep["EstCost"] / cov_min.where(cov_min > 0) * MINUTES_PER_MONTH
+    cost_cols = ["InputCost", "OutputCost", "EstCost", "EstMonthlyCost"]
+    dep[cost_cols] = dep[cost_cols].round(4)
+    return dep
+
+
+THRESHOLDS = {"high_pct": 80.0, "low_pct": 10.0, "quota_pct": 90.0, "ptu_low": 40.0, "ptu_high": 90.0, "avail_min": 99.0,
+              "client_err_pct": 5.0}
+
+
+def recommend(m, quota_util, th: dict = THRESHOLDS):
+    """Rule-based, explainable recommendations (one string per deployment, rules joined with '; ')."""
+    import pandas as pd
+    q = quota_util[["SubscriptionId", "Region", "QuotaName", "AssignedPct", "PctOfQuotaTPM_Max"]]
+    m = m.assign(SubscriptionId=m["ResourceId"].str.lower().str.split("/").str[2]).merge(
+        q, on=["SubscriptionId", "Region", "QuotaName"], how="left")
+    ptu = m["DeploymentSku"].fillna("").str.contains("Provisioned")
+    thr = m["Throttled429_Sum"].fillna(0) > 0
+    pct_max, pct_p99 = m["PctOfTPM_Max"], m["PctOfTPM_P99"]
+    rules = [
+        (m["DataStatus"] == "No traffic (confirmed)", "No traffic in window: deletion candidate (frees quota)"),
+        (m["DataStatus"] == "No data (incomplete coverage)", "Incomplete data: re-run extraction before deciding"),
+        (thr & (pct_max >= th["high_pct"]), "429 at TPM limit: increase capacity or spread load"),
+        (thr & ~(pct_max >= th["high_pct"]), "429 below TPM limit: check RPM, bursts and max_tokens"),
+        (~ptu & ~thr & (pct_max < 50) & (pct_p99 < th["low_pct"]), "Low use vs TPM limit: reduce capacity to free quota"),
+        (ptu & (m["Util_P99"] > th["ptu_high"]), "PTU near saturation: add PTU or spillover"),
+        (ptu & (m["Util_P99"] < th["ptu_low"]), "PTU under-utilized: reduce PTU"),
+        ((m["AssignedPct"] > th["quota_pct"]) | (m["PctOfQuotaTPM_Max"] > th["quota_pct"]),
+         f"Quota > {th['quota_pct']:.0f}%: request increase or use another region/Data Zone"),
+        ((m["Errors5xx_Sum"].fillna(0) > 0) | (m["Avail_Min"] < th["avail_min"]), "Service errors: review 5xx/availability"),
+        (_pct(m["Errors4xx_Sum"], m["Requests_Sum"]) > th["client_err_pct"],
+         f"Client errors (4xx, not 429) > {th['client_err_pct']:.0f}% of requests: review callers"),
+    ]
+    rec = pd.Series([[] for _ in range(len(m))], index=m.index)
+    for mask, text in rules:
+        for i in m.index[mask.fillna(False)]:
+            rec[i].append(text)
+    deleted = m["DataStatus"] == "Deployment deleted (Unmapped)"
+    m["Recommendation"] = ["; ".join(r) if r else ("" if dl else "OK") for r, dl in zip(rec, deleted)]
+    return m.drop(columns=["SubscriptionId", "AssignedPct", "PctOfQuotaTPM_Max"])
+
+
 def run_meta(run_dirs: list[Path]):
     """run.json metadata of each extraction folder (one row per run)."""
     import pandas as pd
@@ -539,9 +801,12 @@ MODEL_COLS = {
     "Tokens_P99": "TPM P99", "Tokens_Max": "TPM max", "Tokens_MaxTimestamp": "TPM peak (UTC)",
     "PctOfTPM_P99": "% TPM P99", "PctOfTPM_Max": "% TPM max",
     "Requests_P99": "RPM P99", "Requests_Max": "RPM max", "PctOfRPM_Max": "% RPM max",
-    "Throttled429_Sum": "429 requests",
+    "Throttled429_Sum": "429 requests", "Errors4xx_Sum": "Other 4xx", "Errors5xx_Sum": "5xx", "ErrorRatePct": "Error rate %",
+    "TTR_P95": "Time to response P95 ms (1-min avg)", "TTLT_P95": "Time to last token P95 ms (1-min avg)",
+    "Avail_Min": "Availability min %",
     "Util_P95": "PTU utilization P95 %", "Util_P99": "PTU utilization P99 %", "Util_Max": "PTU utilization max %",
-    "Tokens_CompletenessPct": "Coverage %", "Status": "Data status",
+    "EstCost": "Est. cost (window)", "EstMonthlyCost": "Est. cost / 30 days", "Currency": "Currency",
+    "TokensCoveragePct": "Coverage %", "DataStatus": "Data status", "Recommendation": "Recommendation",
 }
 QUOTA_XLS_COLS = {
     "SubscriptionName": "Subscription", "Region": "Region", "QuotaName": "Quota", "DeploymentType": "Type",
@@ -552,9 +817,8 @@ QUOTA_XLS_COLS = {
 }
 
 
-def model_sheet(stats, dep_lim):
-    """One row per deployment: limits, per-minute input/output/total P95-P99-max, % of limit, 429, PTU utilization."""
-    import pandas as pd
+def enrich_deployments(stats, dep_lim, lat, quota_util):
+    """Per deployment: limits + input/output P95 + PTU utilization + latency/availability + recommendation."""
     full = stats[stats["Mode"] == "FullWindow"].copy()
     full["rid"] = full["ResourceId"].str.lower()
     keys = ["rid", "DeploymentName"]
@@ -565,26 +829,26 @@ def model_sheet(stats, dep_lim):
     u = full[(full["Level"] == "Deployment") & (full["Metric"] == UTIL) & (full["Aggregation"] == "Maximum")]
     u = u.groupby(keys, as_index=False)[["P95", "P99", "Max"]].max()
     m = m.merge(u.rename(columns={c: f"Util_{c}" for c in ("P95", "P99", "Max")}), on=keys, how="left")
+    m = m.merge(lat, on=keys, how="left")
+    lat_cols = ["TTR_P95", "TTLT_P95", "TPS_P50", "Avail_Min", "Avail_Avg"]
+    m[lat_cols] = m[lat_cols].astype(float).round(1)
+    errs = m[["Throttled429_Sum", "Errors4xx_Sum", "Errors5xx_Sum"]].sum(axis=1, min_count=1)
+    m["ErrorRatePct"] = _pct(errs, m["Requests_Sum"])
+    return recommend(m, quota_util).drop(columns=["rid"])
 
+
+def model_sheet(m):
+    """Excel view: one row per deployment, minimum columns, ordered by pressure."""
+    import pandas as pd
     ptu = m["DeploymentSku"].fillna("").str.contains("Provisioned")
     no_tpm = m["TokensPerMinuteLimit"].isna() & ~ptu
-    unmapped = m["QuotaName"].fillna("").str.startswith("Unmapped")
-    no_data = m["Tokens_Max"].isna() & m["Requests_Max"].isna()
-    incomplete = m["Tokens_CompletenessPct"].fillna(100) < 100
-    m["Status"] = "With metrics"
-    m.loc[no_tpm, "Status"] = "No TPM limit (RPM only)"
-    m.loc[m["Tokens_Max"].isna() & m["Requests_Max"].notna(), "Status"] = "Token metric not available"
-    m.loc[incomplete, "Status"] = "Incomplete coverage"
-    m.loc[no_data, "Status"] = "No traffic observed"
-    m.loc[unmapped, "Status"] = "Deployment deleted (Unmapped)"
-
+    idle = m["DataStatus"].isin(["No traffic (confirmed)", "No data (incomplete coverage)", "Deployment deleted (Unmapped)"])
     rank = pd.Series(1, index=m.index)
     rank[ptu] = 2
     rank[no_tpm] = 3
-    rank[no_data | unmapped] = 4
+    rank[idle] = 4
     rank[m["Throttled429_Sum"].fillna(0) > 0] = 0
-    m["_rank"] = rank
-    m["_key"] = m["PctOfTPM_Max"].where(~ptu, m["Util_Max"]).fillna(m["PctOfRPM_Max"])
+    m = m.assign(_rank=rank, _key=m["PctOfTPM_Max"].where(~ptu, m["Util_Max"]).fillna(m["PctOfRPM_Max"]))
     m = m.sort_values(["_rank", "_key", "Tokens_Max"], ascending=[True, False, False], na_position="last")
 
     out = m[list(MODEL_COLS)].astype(object)
@@ -593,8 +857,9 @@ def model_sheet(stats, dep_lim):
         out.loc[ptu | no_tpm, c] = NA
     for c in ("Util_P95", "Util_P99", "Util_Max"):
         out.loc[~ptu, c] = NA
+    for c in ("EstCost", "EstMonthlyCost"):
+        out.loc[ptu, c] = NA
     return out.rename(columns=MODEL_COLS).reset_index(drop=True)
-
 
 def quota_sheet(quota_util):
     q = quota_util[list(QUOTA_XLS_COLS)].astype(object)
@@ -605,7 +870,7 @@ def quota_sheet(quota_util):
     return q.rename(columns=QUOTA_XLS_COLS).reset_index(drop=True)
 
 
-def write_excel(path: Path, info: dict, runs, models, quotas, generated_at: str, ts: str) -> None:
+def write_excel(path: Path, info: dict, runs, models, quotas, generated_at: str, ts: str, price_note: str) -> None:
     """Compact report: Summary + Models (one row per deployment) + Quotas. No charts; detail stays in the CSVs."""
     import pandas as pd
     from openpyxl.styles import Alignment, Font
@@ -613,6 +878,14 @@ def write_excel(path: Path, info: dict, runs, models, quotas, generated_at: str,
     from openpyxl.worksheet.table import Table, TableStyleInfo
 
     cov = pd.to_numeric(models["Coverage %"], errors="coerce")
+    monthly = pd.to_numeric(models["Est. cost / 30 days"], errors="coerce")
+    # Never add amounts in different currencies: one total per currency.
+    by_cur = monthly.groupby(models["Currency"].fillna("?")).sum()
+    cost_txt = "No prices supplied (--prices / --fetch-prices)" if monthly.isna().all() else \
+        "; ".join(f"{v:,.2f} {c}" for c, v in by_cur.items()) + \
+        f" ({int(monthly.notna().sum())} of {len(models)} deployments priced)"
+    recs = models["Recommendation"].fillna("").str.split("; ").explode()
+    rec_rows = [(f"  {k}", int(v)) for k, v in recs[recs.ne("") & recs.ne("OK")].value_counts().items()] or [("  None", "")]
     summary = [
         ("Report generated (UTC)", generated_at),
         ("Analysed window (UTC)", f"{info['start']} -> {info['end']} ({info['window_minutes']:,} min)"),
@@ -623,6 +896,13 @@ def write_excel(path: Path, info: dict, runs, models, quotas, generated_at: str,
         ("Deployments", len(models)),
         ("Deployments with 429", int((pd.to_numeric(models["429 requests"], errors="coerce") > 0).sum())),
         ("Minimum coverage %", "" if cov.isna().all() else float(cov.min())),
+        ("Deployments with no traffic (confirmed)", int((models["Data status"] == "No traffic (confirmed)").sum())),
+        ("Deployments with 5xx", int((pd.to_numeric(models["5xx"], errors="coerce") > 0).sum())),
+        ("Est. cost / 30 days (PAYG list price)", cost_txt),
+        ("Prices", price_note),
+        ("", ""),
+        ("Recommendations", ""),
+        *rec_rows,
         ("", ""),
         ("How to read it", ""),
         ("TPM / RPM", "Tokens and requests per minute (Total aggregation at PT1M). Input and output are shown separately."),
@@ -632,6 +912,15 @@ def write_excel(path: Path, info: dict, runs, models, quotas, generated_at: str,
         ("429", "Direct saturation signal: the rate limiter counts estimated tokens (prompt + max_tokens), "
                 "so the real pressure can be higher than the % shown."),
         ("Quotas", "Per-minute sum of all deployments sharing a quota (subscription + region/data zone + type + model)."),
+        ("Latency", "P95 over minutes with requests of the 1-minute AVERAGE (Azure Monitor does not expose per-request "
+                    "percentiles). Time to response = time to first token for streaming requests. Availability = min "
+                    "of the 1-minute availability rate. Errors: other 4xx exclude 429; error rate = (429+4xx+5xx)/requests."),
+        ("Data status", "'No traffic (confirmed)' = every minute of the window was successfully queried for tokens and "
+                        "requests and nothing was returned. 'No data (incomplete coverage)' = some chunks failed or were "
+                        "not queried: absence of metrics is NOT proof of zero traffic."),
+        ("Cost", "Estimate = input and output tokens x list PAYG price per 1M (--prices file or --fetch-prices candidates). "
+                 "Cached-input discounts, batch, priority, fine-tuning and PTU commitments are NOT included. "
+                 "'/ 30 days' extrapolates the covered minutes."),
         ("More detail", f"CSVs from this execution (_{ts}): foundry-token-stats, foundry-deployment-limits, "
                         "foundry-quota-utilization, foundry-token-daily, foundry-token-hourly; and in the run folder: "
                         "foundry-token-metrics (minutes), deployments, quota, resources, manifest."),
@@ -641,6 +930,7 @@ def write_excel(path: Path, info: dict, runs, models, quotas, generated_at: str,
     res = pd.DataFrame(summary, columns=["Item", "Value"])
 
     pct_cols = {c for df in (models, quotas) for c in df.columns if "%" in c}
+    money_cols = {"Est. cost (window)", "Est. cost / 30 days"}
     with pd.ExcelWriter(path, engine="openpyxl") as xw:
         res.to_excel(xw, sheet_name="Summary", index=False)
         ws = xw.sheets["Summary"]
@@ -664,7 +954,7 @@ def write_excel(path: Path, info: dict, runs, models, quotas, generated_at: str,
                 width = max([len(str(col))] + [len(str(x)) for x in df[col].head(200) if x is not None]) + 2
                 ws.column_dimensions[letter].width = min(45, max(10, width))
                 ws.cell(row=1, column=i).alignment = Alignment(wrap_text=True, vertical="top")
-                fmt = '0.00"%"' if col in pct_cols else "#,##0"
+                fmt = '0.00"%"' if col in pct_cols else "#,##0.00" if col in money_cols else "#,##0"
                 for (c,) in ws.iter_rows(min_row=2, min_col=i, max_col=i):
                     if isinstance(c.value, (int, float)):
                         c.number_format = fmt
@@ -686,12 +976,23 @@ def main() -> None:
     stats = compute_stats(con, info["window_minutes"])
     day = daily(con)
     hour = hourly(con)
-    dep_lim, quota_util = limit_reports(con, stats)
+    dep_lim, quota_util = limit_reports(con, stats, info["window_minutes"])
 
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc)
     ts = now.strftime("%Y%m%d-%H%M%SZ")
     generated_at = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    dep_lim = add_costs(resolve_prices(dep_lim, a.prices, a.fetch_prices, a.currency, out, ts), info["window_minutes"])
+    dep_lim = enrich_deployments(stats, dep_lim, latency_summary(con), quota_util)
+    in_p, out_p = dep_lim["InputPer1M"].notna(), dep_lim["OutputPer1M"].notna()
+    payg = dep_lim["DeploymentSku"].map(deployment_type).notna()
+    unpriced = sorted(set(dep_lim.loc[payg & ~in_p & ~out_p, "ModelName"].dropna()) |
+                      {f"{m} (input or output price missing)" for m in dep_lim.loc[payg & (in_p ^ out_p), "ModelName"].dropna()})
+    price_note = ("Not requested" if not (a.prices or a.fetch_prices) else
+                  f"Sources: {', '.join(sorted(dep_lim['PriceSource'].dropna().unique())) or 'none matched'}. "
+                  f"Unpriced models (add them to --prices): {', '.join(unpriced) or 'none'}")
+    if unpriced and (a.prices or a.fetch_prices):
+        print(f"Prices: no unambiguous price for {', '.join(unpriced)} (add them to a --prices file).")
 
     stats_path = out / f"foundry-token-stats_{ts}.csv"
     stats.to_csv(stats_path, index=False)
@@ -710,7 +1011,7 @@ def main() -> None:
 
     if not a.no_excel:
         xlsx = out / f"foundry-token-report_{ts}.xlsx"
-        write_excel(xlsx, info, run_meta(run_dirs), model_sheet(stats, dep_lim), quota_sheet(quota_util), generated_at, ts)
+        write_excel(xlsx, info, run_meta(run_dirs), model_sheet(dep_lim), quota_sheet(quota_util), generated_at, ts, price_note)
         print(f"Excel: {xlsx}")
 
 

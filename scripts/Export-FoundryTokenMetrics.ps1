@@ -5,19 +5,31 @@
     subscription (across tenants) into a CSV file.
 
 .DESCRIPTION
-    1. Resolves tenants (default: every tenant known to Azure CLI) and gets an ARM token per tenant.
+    1. Resolves tenants (default: every tenant known to Azure CLI) and gets tokens per tenant.
     2. Lists enabled subscriptions per tenant and finds Microsoft.CognitiveServices/accounts with
        Azure Resource Graph (queried per tenant, never mixing tenants in one call).
-    3. Validates each account through its metric definitions (must expose the Azure OpenAI metrics).
-    4. Queries Azure Monitor per resource and per time chunk at PT1M:
+    3. Validates each account through its metric definitions (must expose the Azure OpenAI metrics)
+       and reads deployments and the subscription/region quota (in parallel).
+    4. Idle pre-flight (default): one daily-grain query per batch of up to 50 accounts over the whole
+       window. Accounts whose tokens/requests are all zero are recorded as successful empty chunks
+       and are not queried per minute.
+    5. Queries Azure Monitor per time chunk at PT1M, in parallel, using the regional
+       metrics:getBatch API (up to 50 accounts of the same subscription + region per call) and
+       falling back to the per-resource ARM metrics API when batch is not permitted or not usable:
          - Tokens   : ProcessedPromptTokens, GeneratedTokens (Total) split by ModelDeploymentName,
                       ModelVersion, Region. These metrics have NO ModelName dimension.
          - Requests : AzureOpenAIRequests (Total) split by ModelDeploymentName, ModelName,
-                      ModelVersion, Region. Used as the historical source of ModelName.
+                      ModelVersion, Region, StatusCode. Used as the historical source of ModelName
+                      and re-aggregated into ThrottledRequests(429), ClientErrors(4xx), ServerErrors(5xx).
+         - Latency  : (default, -NoLatency to skip) time to response, time to last token, tokens per
+                      second and availability rate (Average, Maximum).
          - PTU      : (optional) AzureOpenAIProvisionedManagedUtilizationV2 (Maximum, Average).
-    5. Writes one atomic part file per resource/chunk plus a manifest of every call, so a run can be
+       Calls whose metrics an account does not define are recorded as 'NotSupported' for it.
+       Every request goes through adaptive rate limiters (per subscription/region, per subscription
+       and global) that slow down and pause all workers as soon as the service throttles.
+    6. Writes one atomic part file per resource/chunk plus a manifest of every call, so a run can be
        resumed safely and statistics can tell real zeros apart from missing data.
-    6. Merges the parts into <OutputDirectory>\foundry-token-metrics.csv.
+    7. Merges the parts into <OutputDirectory>\foundry-token-metrics.csv.
 
     Only non-zero points are written (sparse). Minutes covered by a *successful* call with no
     row are real zeros; minutes of failed calls are unknown (see manifest.csv).
@@ -47,7 +59,8 @@
     service rejects them as too large.
 
 .PARAMETER TenantId
-    Tenants to process. Default: distinct tenants from 'az account list --all'.
+    Tenants to process. Default: every tenant returned by ARM GET /tenants for the signed-in identity
+    (required with -AuthMode ManagedIdentity).
 
 .PARAMETER SubscriptionId
     Optional subscription allow-list.
@@ -59,14 +72,44 @@
 .PARAMETER IncludePtuUtilization
     Also extract AzureOpenAIProvisionedManagedUtilizationV2 (Maximum and Average per minute).
 
+.PARAMETER NoLatency
+    Skip the latency/availability call (AzureOpenAITimeToResponse, AzureOpenAITTLTInMS,
+    AzureOpenAITokenPerSecond, AzureOpenAIAvailabilityRate; Average and Maximum per minute). Saves one
+    metrics call per batch and chunk.
+
 .PARAMETER Top
-    Max time series per metrics call. If a call returns this many series, it is re-queried per
-    deployment to avoid silent truncation. If a single deployment still reaches the limit the
-    chunk is marked 'Truncated': it is excluded from statistics coverage and retried on resume
-    (you may raise -Top when resuming).
+    Max time series per metrics call and resource. If a resource returns this many series, it is
+    re-queried per deployment to avoid silent truncation. If a single deployment still reaches the
+    limit the chunk is marked 'Truncated': it is excluded from statistics coverage and retried on
+    resume (you may raise -Top when resuming).
+
+.PARAMETER MetricsApi
+    Batch (default): regional metrics:getBatch, falling back to ARM per subscription/region when it
+    is not permitted (it needs Monitoring Reader or Reader at subscription scope). Arm: classic
+    per-resource ARM metrics API only.
+
+.PARAMETER Parallel
+    Number of concurrent workers (1-32, default 6). Request rates are still bounded by the adaptive
+    rate limiters, so raising it never bypasses throttling protection.
+
+.PARAMETER NoSkipIdle
+    Disable the idle pre-flight and query every account per minute.
+
+.PARAMETER MaxPointsPerResponse
+    Budget used to size getBatch calls (default 500000 data points per response). Batches are split
+    automatically if the service still rejects them as too large.
 
 .PARAMETER InventoryOnly
     Only discover subscriptions/resources/deployments (resources.csv), no metrics.
+
+.PARAMETER AuthMode
+    Token provider: Auto (default: Azure CLI if installed, else Az PowerShell, else managed identity when
+    IDENTITY_ENDPOINT is set), AzCli (az login), AzPowerShell (Connect-AzAccount, needs Az.Accounts) or
+    ManagedIdentity (IMDS or App Service/Container Apps identity endpoint; requires -TenantId). Auto never
+    switches provider after an authentication failure.
+
+.PARAMETER ManagedIdentityClientId
+    Client id of a user-assigned managed identity (only with -AuthMode ManagedIdentity).
 
 .EXAMPLE
     pwsh -File .\scripts\Export-FoundryTokenMetrics.ps1 -Days 90 -ChunkHours 24 -IncludePtuUtilization
@@ -88,21 +131,30 @@ param(
     [string[]] $Kind = @('OpenAI', 'AIServices'),
     [switch]   $IncludeAllKinds,
     [switch]   $IncludePtuUtilization,
+    [switch]   $NoLatency,
     [ValidateRange(10, 10000)] [int] $Top = 1000,
     [ValidateRange(1, 10)] [int] $MaxRetries = 6,
     [ValidateRange(10, 600)] [int] $TokenTimeoutSeconds = 60,
+    [ValidateSet('Batch', 'Arm')] [string] $MetricsApi = 'Batch',
+    [ValidateRange(1, 32)] [int] $Parallel = 6,
+    [switch]   $NoSkipIdle,
+    [ValidateRange(10000, 5000000)] [int] $MaxPointsPerResponse = 500000,
+    [ValidateSet('Auto', 'AzCli', 'AzPowerShell', 'ManagedIdentity')] [string] $AuthMode = 'Auto',
+    [string]   $ManagedIdentityClientId,
     [switch]   $InventoryOnly
 )
 
 Set-StrictMode -Version 3.0
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 
-$SchemaVersion = 4
-$Arm = 'https://management.azure.com'
-$MetricsApi = '2023-10-01'
-$Inv = [System.Globalization.CultureInfo]::InvariantCulture
-$Utf8 = [System.Text.UTF8Encoding]::new($false)
+$CommonFile = Join-Path $PSScriptRoot 'FoundryInsights.Common.ps1'
+. $CommonFile
 
+$SchemaVersion = 5
+$Interval = 'PT1M'
+$MetricsApiMode = $MetricsApi
+$MaxBatchResources = 50
 $CsvColumns = @(
     'Timestamp', 'SubscriptionId', 'SubscriptionName', 'ResourceGroup', 'ResourceName', 'Region',
     'DeploymentName', 'ModelName', 'ModelVersion', 'Metric', 'Total',
@@ -110,119 +162,42 @@ $CsvColumns = @(
 )
 $ManifestColumns = @('RecordedAt', 'ResourceId', 'ChunkStart', 'ChunkEnd', 'Call', 'Status', 'SeriesCount', 'Rows', 'Truncated', 'Message')
 
+$Calls = [ordered]@{
+    Tokens   = @{ Metrics = 'ProcessedPromptTokens,GeneratedTokens'; Aggregation = 'Total'; Aggs = @('total'); Dims = @('ModelDeploymentName', 'ModelVersion', 'Region') }
+    Requests = @{ Metrics = 'AzureOpenAIRequests'; Aggregation = 'Total'; Aggs = @('total'); Dims = @('ModelDeploymentName', 'ModelName', 'ModelVersion', 'Region', 'StatusCode') }
+}
+# Requests split by StatusCode are re-aggregated: AzureOpenAIRequests = all codes, plus ThrottledRequests(429),
+# ClientErrors(4xx) (other 4xx) and ServerErrors(5xx).
+if (-not $NoLatency) {
+    # Per-minute average and maximum per deployment, queried only for deployments with requests in the chunk
+    # and written only for minutes with requests (zeros kept: 0 % availability is a real outage).
+    $Calls['Latency'] = @{ Metrics = 'AzureOpenAITimeToResponse,AzureOpenAITTLTInMS,AzureOpenAITokenPerSecond,AzureOpenAIAvailabilityRate'
+        Aggregation = 'Average,Maximum'; Aggs = @('average', 'maximum'); ActiveOnly = $true; Dims = @('ModelDeploymentName', 'ModelName', 'ModelVersion', 'Region') }
+}
+if ($IncludePtuUtilization) {
+    $Calls['PtuUtilization'] = @{ Metrics = 'AzureOpenAIProvisionedManagedUtilizationV2'; Aggregation = 'Maximum,Average'; Aggs = @('maximum', 'average'); Dims = @('ModelDeploymentName', 'ModelName', 'ModelVersion', 'Region') }
+}
+$RequiredMetrics = @('ProcessedPromptTokens', 'GeneratedTokens', 'AzureOpenAIRequests')
+
+# Shared (thread-safe) state, passed by reference to every worker runspace.
+$TokenCache = [System.Collections.Concurrent.ConcurrentDictionary[string, object]]::new()
+$BatchCap = [System.Collections.Concurrent.ConcurrentDictionary[string, string]]::new()
+$BatchCapReason = [System.Collections.Concurrent.ConcurrentDictionary[string, string]]::new()
+$CanRefreshTokens = $true
+# Initial / minimum / maximum requests per second. Limits are additive-increase, halve on throttling.
+$Limiters = [FoundryInsights.LimiterSet]::new()
+$Limiters.Configure('batch-global', 20, 1, 50)      # metrics:getBatch, all regions
+$Limiters.Configure('batch', 4, 0.5, 10)            # metrics:getBatch per subscription + region
+$Limiters.Configure('arm-global', 10, 1, 15)        # every ARM request
+$Limiters.Configure('arm', 5, 0.5, 10)              # ARM per subscription
+$Limiters.Configure('armmetrics', 1.5, 0.2, 3)      # ARM metrics API per subscription (~12k/h)
+$Limiters.Configure('arg', 1, 0.2, 2)               # Resource Graph
+
 #region helpers ---------------------------------------------------------------------------------
 function Write-Log([string]$Message, [string]$Level = 'INFO') {
     $line = '{0:yyyy-MM-dd HH:mm:ss} [{1}] {2}' -f (Get-Date), $Level, $Message
     if ($Level -eq 'WARN') { Write-Warning $Message } else { Write-Host $line }
     Add-Content -LiteralPath $script:LogFile -Value $line -Encoding utf8NoBOM
-}
-
-function ConvertTo-CsvField($Value) {
-    if ($null -eq $Value) { return '' }
-    $s = if ($Value -is [double] -or $Value -is [single] -or $Value -is [decimal]) { ([double]$Value).ToString('R', $Inv) }
-    elseif ($Value -is [datetime]) { $Value.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", $Inv) }
-    else { [string]$Value }
-    if ($s.IndexOfAny([char[]]@(',', '"', "`r", "`n")) -ge 0) { return '"' + $s.Replace('"', '""') + '"' }
-    return $s
-}
-
-function ConvertTo-CsvLine([object[]]$Values) { ($Values | ForEach-Object { ConvertTo-CsvField $_ }) -join ',' }
-
-function ConvertTo-UtcDate($Value) {
-    if ($Value -is [datetime]) {
-        if ($Value.Kind -eq [DateTimeKind]::Unspecified) { return [datetime]::SpecifyKind($Value, [DateTimeKind]::Utc) }
-        return $Value.ToUniversalTime()
-    }
-    if ($Value -is [datetimeoffset]) { return $Value.UtcDateTime }
-    return [datetimeoffset]::Parse([string]$Value, $Inv).UtcDateTime
-}
-
-function Format-Utc([datetime]$d) { $d.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", $Inv) }
-
-function Get-ArmToken([string]$Tenant, [switch]$Force) {
-    $cached = $script:Tokens[$Tenant]
-    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-    if (-not $Force -and $cached -and ($cached.ExpiresOn - $now) -gt 300) { return $cached.Token }
-    # az may block waiting for interactive login (MFA/CA) on some tenants: bound it with a timeout.
-    $psi = [System.Diagnostics.ProcessStartInfo]::new($script:AzExe)
-    foreach ($a in @('account', 'get-access-token', '--tenant', $Tenant, '--resource', "$Arm/", '-o', 'json', '--only-show-errors')) { $psi.ArgumentList.Add($a) }
-    $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true; $psi.UseShellExecute = $false
-    $proc = [System.Diagnostics.Process]::Start($psi)
-    $proc.StandardInput.Close()
-    $outTask = $proc.StandardOutput.ReadToEndAsync(); $null = $proc.StandardError.ReadToEndAsync()
-    $json = $null
-    if ($proc.WaitForExit($TokenTimeoutSeconds * 1000)) {
-        if ($proc.ExitCode -eq 0) { $json = $outTask.GetAwaiter().GetResult() }
-    }
-    else {
-        try { $proc.Kill($true) } catch { }
-        Write-Log "Tenant ${Tenant}: token request timed out after $TokenTimeoutSeconds s (interactive login required?)" 'WARN'
-    }
-    $proc.Dispose()
-    if (-not $json) {
-        throw "Cannot get an ARM token for tenant $Tenant. Run: az login --tenant $Tenant"
-    }
-    $t = $json | ConvertFrom-Json
-    $exp = if ($t.PSObject.Properties['expires_on'] -and $t.expires_on) { [long]$t.expires_on } else { $now + 1800 }
-    $script:Tokens[$Tenant] = [pscustomobject]@{ Token = $t.accessToken; ExpiresOn = $exp }
-    return $t.accessToken
-}
-
-class ArmException : System.Exception {
-    [int]$StatusCode
-    [string]$Body
-    ArmException([int]$code, [string]$body, [string]$msg) : base($msg) { $this.StatusCode = $code; $this.Body = $body }
-}
-
-function Invoke-Arm {
-    param([string]$Tenant, [string]$Uri, [string]$Method = 'GET', $Body)
-    if ($Uri -notmatch '^https://') { $Uri = $Arm + $Uri }
-    $attempt = 0
-    $refreshed = $false
-    while ($true) {
-        $attempt++
-        $headers = @{ Authorization = "Bearer $(Get-ArmToken $Tenant)" }
-        $params = @{ Uri = $Uri; Method = $Method; Headers = $headers; SkipHttpErrorCheck = $true; TimeoutSec = 300 }
-        if ($null -ne $Body) { $params.Body = ($Body | ConvertTo-Json -Depth 20 -Compress); $params.ContentType = 'application/json' }
-        $resp = $null
-        try { $resp = Invoke-WebRequest @params }
-        catch {
-            if ($attempt -le $MaxRetries) {
-                $wait = [math]::Min(120, [math]::Pow(2, $attempt))
-                Write-Verbose "Transport error ($($_.Exception.Message)); retry in $wait s"
-                Start-Sleep -Seconds $wait; continue
-            }
-            throw [ArmException]::new(0, '', "Transport error: $($_.Exception.Message)")
-        }
-        $code = [int]$resp.StatusCode
-        $content = [string]$resp.Content
-        if ($code -ge 200 -and $code -lt 300) {
-            if ([string]::IsNullOrWhiteSpace($content)) { return $null }
-            return $content | ConvertFrom-Json -Depth 100
-        }
-        if ($code -eq 401 -and -not $refreshed) { $null = Get-ArmToken $Tenant -Force; $refreshed = $true; continue }
-        if (($code -eq 429 -or $code -ge 500) -and $attempt -le $MaxRetries) {
-            $ra = 0
-            $raHeader = $resp.Headers['Retry-After']
-            if ($raHeader) { [void][int]::TryParse(([string]($raHeader | Select-Object -First 1)), [ref]$ra) }
-            $wait = if ($ra -gt 0) { $ra } else { [math]::Min(120, [math]::Pow(2, $attempt)) }
-            Write-Verbose "HTTP $code on $Uri; retry $attempt/$MaxRetries in $wait s"
-            Start-Sleep -Seconds $wait; continue
-        }
-        $msg = $content
-        try { $e = $content | ConvertFrom-Json; if ($e.error.message) { $msg = "$($e.error.code): $($e.error.message)" } } catch { }
-        throw [ArmException]::new($code, $content, "HTTP $code - $msg")
-    }
-}
-
-function Get-ArmPaged([string]$Tenant, [string]$Uri) {
-    $items = [System.Collections.Generic.List[object]]::new()
-    while ($Uri) {
-        $r = Invoke-Arm -Tenant $Tenant -Uri $Uri
-        if ($r -and $r.PSObject.Properties['value'] -and $r.value) { $items.AddRange([object[]]$r.value) }
-        $Uri = if ($r -and $r.PSObject.Properties['nextLink']) { $r.nextLink } else { $null }
-    }
-    return , $items
 }
 
 function Invoke-ResourceGraph([string]$Tenant, [string[]]$Subscriptions, [string]$Query) {
@@ -240,159 +215,6 @@ function Invoke-ResourceGraph([string]$Tenant, [string[]]$Subscriptions, [string
         } while ($skip)
     }
     return , $rows
-}
-
-function Get-Prop($Obj, [string]$Path) {
-    foreach ($p in $Path.Split('.')) {
-        if ($null -eq $Obj -or -not $Obj.PSObject.Properties[$p]) { return $null }
-        $Obj = $Obj.$p
-    }
-    return $Obj
-}
-#endregion
-
-#region metrics ---------------------------------------------------------------------------------
-$Calls = [ordered]@{
-    Tokens   = @{ Metrics = 'ProcessedPromptTokens,GeneratedTokens'; Aggregation = 'Total'; Dims = @('ModelDeploymentName', 'ModelVersion', 'Region') }
-    Requests = @{ Metrics = 'AzureOpenAIRequests'; Aggregation = 'Total'; Dims = @('ModelDeploymentName', 'ModelName', 'ModelVersion', 'Region', 'StatusCode') }
-}
-# Requests split by StatusCode are re-aggregated: AzureOpenAIRequests = all codes, ThrottledMetric = 429 only.
-$ThrottledMetric = 'ThrottledRequests(429)'
-if ($IncludePtuUtilization) {
-    $Calls['PtuUtilization'] = @{ Metrics = 'AzureOpenAIProvisionedManagedUtilizationV2'; Aggregation = 'Maximum,Average'; Dims = @('ModelDeploymentName', 'ModelName', 'ModelVersion', 'Region') }
-}
-$RequiredMetrics = @('ProcessedPromptTokens', 'GeneratedTokens', 'AzureOpenAIRequests')
-
-function New-MetricsUri([string]$ResourceId, [hashtable]$Call, [datetime]$From, [datetime]$To, [string]$Deployment, [switch]$Metadata) {
-    $clauses = foreach ($d in $Call.Dims) {
-        if ($Deployment -and $d -eq 'ModelDeploymentName') { "ModelDeploymentName eq '$($Deployment.Replace("'", "''"))'" } else { "$d eq '*'" }
-    }
-    $q = [ordered]@{
-        'api-version'       = $MetricsApi
-        metricnamespace     = 'Microsoft.CognitiveServices/accounts'
-        metricnames         = $Call.Metrics
-        timespan            = "$(Format-Utc $From)/$(Format-Utc $To)"
-        interval            = 'PT1M'
-        aggregation         = $Call.Aggregation
-        '$filter'           = ($clauses -join ' and ')
-        top                 = $Top
-        AutoAdjustTimegrain = 'false'
-        ValidateDimensions  = 'false'
-    }
-    if ($Metadata) {
-        $q['resultType'] = 'metadata'; $q.Remove('interval'); $q.Remove('AutoAdjustTimegrain')
-        $q['$filter'] = "ModelDeploymentName eq '*'"; $q['top'] = 10000
-    }
-    $qs = ($q.GetEnumerator() | ForEach-Object { "$($_.Key)=$([uri]::EscapeDataString([string]$_.Value))" }) -join '&'
-    return "$Arm$ResourceId/providers/Microsoft.Insights/metrics?$qs"
-}
-
-function Test-TooLarge([ArmException]$Ex) {
-    if ($Ex.StatusCode -in 0, 413, 504) { return $true }
-    if ($Ex.StatusCode -eq 400 -and $Ex.Message -match '(?i)exceed|too (many|large|much)|limit|timeout|timed out') { return $true }
-    return $false
-}
-
-function ConvertTo-Series($Metric, $Ts) {
-    $dims = @{}
-    if ($Ts.PSObject.Properties['metadatavalues']) {
-        foreach ($mv in @($Ts.metadatavalues)) { if ($mv) { $dims[$mv.name.value.ToLowerInvariant()] = [string]$mv.value } }
-    }
-    $data = if ($Ts.PSObject.Properties['data']) { @($Ts.data) } else { @() }
-    [pscustomobject]@{ Metric = $Metric.name.value; Dims = $dims; Data = $data }
-}
-
-function Assert-MetricResponse($Resp) {
-    if ($Resp.PSObject.Properties['interval'] -and $Resp.interval -and $Resp.interval -ne 'PT1M') {
-        throw "Service returned interval $($Resp.interval) instead of PT1M"
-    }
-    foreach ($m in @($Resp.value)) {
-        if ($m.PSObject.Properties['errorCode'] -and $m.errorCode -and $m.errorCode -ne 'Success') {
-            throw "Metric $($m.name.value) error: $($m.errorCode) $($m.errorMessage)"
-        }
-    }
-}
-
-# Returns @{ Series = list of @{Metric; Dims; Data}; Truncated; Notes }
-function Get-MetricSeries([object]$Res, [string]$CallName, [datetime]$From, [datetime]$To) {
-    $call = $Calls[$CallName]
-    $result = [pscustomobject]@{ Series = [System.Collections.Generic.List[object]]::new(); Truncated = $false; Notes = [System.Collections.Generic.List[string]]::new() }
-    try {
-        $resp = Invoke-Arm -Tenant $Res.TenantId -Uri (New-MetricsUri $Res.Id $call $From $To)
-    }
-    catch [ArmException] {
-        $ex = $_.Exception
-        if ((Test-TooLarge $ex) -and ($To - $From).TotalMinutes -gt 60) {
-            $mid = $From.AddMinutes([math]::Floor(($To - $From).TotalMinutes / 2))
-            Write-Log "  $CallName window $(Format-Utc $From) too large ($($ex.StatusCode)); splitting" 'WARN'
-            $a = Get-MetricSeries $Res $CallName $From $mid
-            $b = Get-MetricSeries $Res $CallName $mid $To
-            $a.Series.AddRange($b.Series); $a.Notes.AddRange($b.Notes); $a.Truncated = $a.Truncated -or $b.Truncated
-            return $a
-        }
-        throw
-    }
-    Assert-MetricResponse $resp
-
-    $truncated = $false
-    foreach ($m in $resp.value) { if (@($m.timeseries).Count -ge $Top) { $truncated = $true } }
-
-    if (-not $truncated) {
-        foreach ($m in $resp.value) { foreach ($ts in $m.timeseries) { $result.Series.Add((ConvertTo-Series $m $ts)) } }
-        return $result
-    }
-
-    # top reached: re-query deployment by deployment so no series is silently dropped.
-    $meta = Invoke-Arm -Tenant $Res.TenantId -Uri (New-MetricsUri $Res.Id $call $From $To -Metadata)
-    Assert-MetricResponse $meta
-    $deps = @($meta.value | ForEach-Object { $_.timeseries } | ForEach-Object { $_.metadatavalues } |
-        Where-Object { $_.name.value -eq 'modeldeploymentname' } | ForEach-Object { $_.value } | Sort-Object -Unique)
-    $result.Notes.Add("top=$Top reached; re-queried $($deps.Count) deployments individually")
-    foreach ($dep in $deps) {
-        $r = Invoke-Arm -Tenant $Res.TenantId -Uri (New-MetricsUri $Res.Id $call $From $To -Deployment $dep)
-        Assert-MetricResponse $r
-        foreach ($m in $r.value) {
-            if (@($m.timeseries).Count -ge $Top) { $result.Truncated = $true; $result.Notes.Add("deployment $dep still returns top=$Top series") }
-            foreach ($ts in $m.timeseries) { $result.Series.Add((ConvertTo-Series $m $ts)) }
-        }
-    }
-    return $result
-}
-
-# Collapses the StatusCode dimension: one AzureOpenAIRequests series (all codes) plus one
-# ThrottledMetric series (429) per remaining dimension set, so later dedupe never drops codes.
-function Merge-StatusCodeSeries($R) {
-    $groups = [ordered]@{}
-    foreach ($s in $R.Series) {
-        $code = [string]$s.Dims['statuscode']
-        $dims = @{}
-        foreach ($k in $s.Dims.Keys) { if ($k -ne 'statuscode') { $dims[$k] = $s.Dims[$k] } }
-        $base = (@($dims.Keys | Sort-Object) | ForEach-Object { "$_=$($dims[$_])" }) -join '|'
-        $names = @($s.Metric); if ($code -eq '429') { $names += $ThrottledMetric }
-        foreach ($n in $names) {
-            $gk = "$n|$base"
-            if (-not $groups.Contains($gk)) { $groups[$gk] = @{ Metric = $n; Dims = $dims; Sum = [ordered]@{} } }
-            $g = $groups[$gk]
-            foreach ($p in $s.Data) {
-                if (-not $p.PSObject.Properties['total'] -or $null -eq $p.total) { continue }
-                $tk = Format-Utc (ConvertTo-UtcDate $p.timeStamp)
-                $g.Sum[$tk] = $(if ($g.Sum.Contains($tk)) { $g.Sum[$tk] } else { 0.0 }) + [double]$p.total
-            }
-        }
-    }
-    $R.Series.Clear()
-    foreach ($g in $groups.Values) {
-        $data = @(foreach ($e in $g.Sum.GetEnumerator()) { [pscustomobject]@{ timeStamp = $e.Key; total = $e.Value } })
-        $R.Series.Add([pscustomobject]@{ Metric = $g.Metric; Dims = $g.Dims; Data = $data })
-    }
-    return $R
-}
-
-function ConvertTo-PerMinute($Limits, [string]$Key) {
-    $l = @($Limits | Where-Object { $_ -and $_.key -eq $Key }) | Select-Object -First 1
-    if (-not $l -or $null -eq $l.count) { return $null }
-    $period = if ($l.PSObject.Properties['renewalPeriod'] -and $l.renewalPeriod) { [double]$l.renewalPeriod } else { 60.0 }
-    return [double]$l.count * 60.0 / $period
 }
 
 function Get-NormName([string]$s) { ($s -replace '[^A-Za-z0-9]', '').ToLowerInvariant() }
@@ -426,24 +248,100 @@ function Resolve-QuotaName($Dep, [string]$AccountKind, $Models, $Usages) {
     if ($hits.Count -gt 1) { return @(($hits -join '|'), 'Ambiguous') }
     return @('', 'Unmapped')
 }
+
+# Refreshes every cached token that expires within 20 minutes or that a worker reported as rejected (401).
+# Only the coordinator calls the auth provider; workers read the shared cache.
+function Update-TokenCache {
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    foreach ($k in @($TokenCache.Keys)) {
+        if (($TokenCache[$k].ExpiresOn - $now) -ge 1200 -and -not $TokenCache[$k].Rejected) { continue }
+        $t, $a = $k.Split('|', 2)
+        try { $null = Get-AccessToken $t $a -Force } catch { $TokenCache[$k].Rejected = $false; Write-Log "Token refresh failed for ${k}: $($_.Exception.Message)" 'WARN' }
+    }
+}
+
+$WorkerBlock = {
+    $U = $_
+    $logs = [System.Collections.Generic.List[string]]::new()
+    function Write-Log([string]$Message, [string]$Level = 'INFO') { $logs.Add("$Level`t$Message") }
+    Set-StrictMode -Version 3.0
+    $ErrorActionPreference = 'Stop'
+    $ProgressPreference = 'SilentlyContinue'
+    $Top = $using:Top; $MaxRetries = $using:MaxRetries; $TokenTimeoutSeconds = $using:TokenTimeoutSeconds
+    $Calls = $using:Calls; $Interval = $using:Interval; $RequiredMetrics = $using:RequiredMetrics
+    $TokenCache = $using:TokenCache; $Limiters = $using:Limiters; $BatchCap = $using:BatchCap; $BatchCapReason = $using:BatchCapReason
+    $MetricsApiMode = $using:MetricsApiMode; $PartsDir = $using:PartsDir; $AzExe = $using:AzExe
+    $AuthMode = $using:AuthMode; $ManagedIdentityClientId = $using:ManagedIdentityClientId
+    $CanRefreshTokens = $false
+    . $using:CommonFile
+    try { $r = Invoke-WorkUnit $U }
+    catch { $r = [pscustomobject]@{ Type = 'Error'; Unit = $U; Error = "$($_.Exception.Message) @ $($_.InvocationInfo.PositionMessage)" } }
+    $r | Add-Member -NotePropertyName Logs -NotePropertyValue $logs -Force
+    $r
+}
+
+# Runs work units in parallel; $OnResult runs on this thread for every result as it arrives and $OnError
+# for every unit that failed as a whole. Tokens are refreshed on a timer, independently of unit completion.
+function Invoke-Units([object[]]$Units, [scriptblock]$OnResult, [scriptblock]$OnError, [string]$Activity) {
+    if (-not $Units.Count) { return }
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $n = 0; $lastLog = 0; $lastRefresh = 0
+    $job = $Units | ForEach-Object -Parallel $WorkerBlock -ThrottleLimit $Parallel -AsJob
+    try {
+        while ($true) {
+            $finished = $job.State -notin 'NotStarted', 'Running'
+            foreach ($r in @(Receive-Job $job -ErrorAction Continue -ErrorVariable jobErr)) {
+                $n++
+                foreach ($l in $r.Logs) { $lv, $msg = $l.Split("`t", 2); Write-Log $msg $lv }
+                if ($r.Type -eq 'Error') {
+                    Write-Log "$Activity unit failed: $($r.Error)" 'WARN'
+                    if ($OnError) { & $OnError $r }
+                }
+                else { & $OnResult $r }
+            }
+            foreach ($e in @($jobErr)) { if ($e) { Write-Log "$Activity worker error: $e" 'WARN' } }
+            $el = $sw.Elapsed.TotalSeconds
+            if ($el - $lastRefresh -ge 60 -or @($TokenCache.Values | Where-Object Rejected).Count) { $lastRefresh = $el; Update-TokenCache }
+            if ($n -and ($n -eq $Units.Count -or $el - $lastLog -ge 30)) {
+                $lastLog = $el
+                $eta = if ($n -lt $Units.Count) { [timespan]::FromSeconds($el / $n * ($Units.Count - $n)).ToString('hh\:mm\:ss') } else { '00:00:00' }
+                $rate = ($Limiters.Snapshot() | Where-Object { $_.Key -in 'arm-global', 'batch-global' } | ForEach-Object { $_.Value.Calls } | Measure-Object -Sum).Sum
+                Write-Log ("{0}: {1}/{2} units, {3:N0} s elapsed, ETA {4}, {5:N1} calls/s overall" -f $Activity, $n, $Units.Count, $el, $eta, ($rate / [math]::Max(1, ($script:RunClock.Elapsed.TotalSeconds))))
+                if ($n -eq $Units.Count) { $lastLog = [double]::MaxValue }
+            }
+            if ($finished) { break }
+            Start-Sleep -Milliseconds 250
+        }
+    }
+    finally { Remove-Job $job -Force -ErrorAction SilentlyContinue }
+    if ($n -lt $Units.Count) { Write-Log "$Activity`: only $n of $($Units.Count) unit(s) returned a result" 'WARN' }
+}
 #endregion
 
 #region run setup -------------------------------------------------------------------------------
-$azCmd = Get-Command az -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-if (-not $azCmd) { throw 'Azure CLI (az) is required. Install it and run az login.' }
-$script:AzExe = $azCmd.Source
+$AuthMode = Resolve-AuthMode $AuthMode
+$AzExe = $null
+if ($AuthMode -eq 'AzCli') {
+    $azCmd = Get-Command az -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $azCmd) { throw 'Azure CLI (az) is required for -AuthMode AzCli. Install it and run az login.' }
+    $AzExe = $azCmd.Source
+}
+if ($AuthMode -eq 'ManagedIdentity' -and -not $TenantId) { throw '-AuthMode ManagedIdentity requires -TenantId (a managed identity belongs to one tenant).' }
 
 $RunStartedAt = [datetime]::UtcNow
+$script:RunClock = [System.Diagnostics.Stopwatch]::StartNew()
 if (-not $OutputDirectory) { $OutputDirectory = Join-Path $OutputRoot ('{0}_{1:yyyyMMdd-HHmmss}Z' -f $RunName, $RunStartedAt) }
 $OutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
 $PartsDir = Join-Path $OutputDirectory 'parts'
 New-Item -ItemType Directory -Force -Path $PartsDir | Out-Null
+# Exclusive lock for the whole run: two processes resuming the same folder would corrupt the manifest.
+try { $RunLock = [System.IO.File]::Open((Join-Path $OutputDirectory '.run.lock'), 'OpenOrCreate', 'ReadWrite', 'None') }
+catch { throw "Another extraction is already using $OutputDirectory (cannot lock .run.lock)." }
 $script:LogFile = Join-Path $OutputDirectory 'run.log'
 $ManifestFile = Join-Path $OutputDirectory 'manifest.csv'
 $RunFile = Join-Path $OutputDirectory 'run.json'
 $ResourcesFile = Join-Path $OutputDirectory 'resources.csv'
 $OutputCsv = Join-Path $OutputDirectory 'foundry-token-metrics.csv'
-$script:Tokens = @{}
 
 $prev = if (Test-Path $RunFile) { Get-Content $RunFile -Raw | ConvertFrom-Json -AsHashtable } else { $null }
 $nowUtc = [datetime]::UtcNow
@@ -468,7 +366,7 @@ $fingerprint = [ordered]@{
     SchemaVersion = $SchemaVersion
     StartTime     = Format-Utc $StartTime
     EndTime       = Format-Utc $EndTime
-    Interval      = 'PT1M'
+    Interval      = $Interval
     ChunkHours    = $ChunkHours
     Calls         = @($Calls.Keys)
     # Discovery scope: resuming with a different scope would silently mix resource sets.
@@ -486,18 +384,25 @@ if ($prev) {
 if (-not (Test-Path $ManifestFile)) { Set-Content -LiteralPath $ManifestFile -Value ($ManifestColumns -join ',') -Encoding utf8NoBOM }
 Write-Log ("{0} run in {1}" -f ($(if ($prev) { 'Resuming' } else { 'Starting' })), $OutputDirectory)
 
-# Latest manifest status per (resource|chunk|call)
+# Latest manifest status and row count per (resource|chunk|call), and the part files on disk.
 $done = @{}
-foreach ($m in (Import-Csv $ManifestFile)) { $done["$($m.ResourceId)|$($m.ChunkStart)|$($m.Call)"] = $m.Status }
+$doneRows = @{}
+foreach ($m in (Import-Csv $ManifestFile)) {
+    $k = "$($m.ResourceId)|$($m.ChunkStart)|$($m.Call)"
+    $done[$k] = $m.Status; $doneRows[$k] = [long]$m.Rows
+}
+$partNames = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+foreach ($f in (Get-ChildItem -LiteralPath $PartsDir -File -Filter '*.csv')) { [void]$partNames.Add($f.Name) }
 
-Write-Log "Window $(Format-Utc $StartTime) -> $(Format-Utc $EndTime) (PT1M, chunks of $ChunkHours h)"
+Write-Log "Window $(Format-Utc $StartTime) -> $(Format-Utc $EndTime) ($Interval, chunks of $ChunkHours h); metrics API $MetricsApiMode, $Parallel worker(s), idle pre-flight $(-not $NoSkipIdle)"
 #endregion
 
 #region discovery -------------------------------------------------------------------------------
 if (-not $TenantId) {
-    $TenantId = @((& az account list --all -o json | ConvertFrom-Json) | ForEach-Object { $_.tenantId } | Where-Object { $_ } | Sort-Object -Unique)
+    # Home tenant of the signed-in identity lists every tenant it belongs to.
+    $TenantId = @(Get-ArmPaged '' '/tenants?api-version=2022-12-01' | ForEach-Object { $_.tenantId } | Where-Object { $_ } | Sort-Object -Unique)
 }
-Write-Log "Tenants to process: $($TenantId.Count)"
+Write-Log "Tenants to process: $($TenantId.Count) (auth: $AuthMode)"
 
 $subsSeen = @{}
 $tenantSubs = [ordered]@{}
@@ -525,50 +430,32 @@ $kindFilter = if ($IncludeAllKinds) { '' } else { "| where kind in~ ($((($Kind |
 $argQuery = "resources | where type =~ 'microsoft.cognitiveservices/accounts' $kindFilter | project id, name, resourceGroup, subscriptionId, kind, location, sku = tostring(sku.name) | order by id asc"
 
 $resources = [System.Collections.Generic.List[object]]::new()
-$resSeen = @{}
+$resById = @{}
 foreach ($t in $tenantSubs.Keys) {
     try { $rows = Invoke-ResourceGraph $t @($tenantSubs[$t].Id) $argQuery }
     catch { Write-Log "Resource Graph failed for tenant ${t}: $($_.Exception.Message)" 'WARN'; continue }
     foreach ($r in $rows) {
         $rk = $r.id.ToLowerInvariant()
-        if ($resSeen.ContainsKey($rk)) { continue }
-        $resSeen[$rk] = $t
-        $resources.Add([pscustomobject]@{
-                TenantId = $t; Id = $r.id; Name = $r.name; ResourceGroup = $r.resourceGroup
-                SubscriptionId = $r.subscriptionId; SubscriptionName = $subsSeen[$r.subscriptionId]
-                Kind = $r.kind; Location = $r.location; Sku = $r.sku
-                Status = 'Pending'; Message = ''; Deployments = @{}
-            })
+        if ($resById.ContainsKey($rk)) { continue }
+        $o = [pscustomobject]@{
+            TenantId = $t; Id = $r.id; Name = $r.name; ResourceGroup = $r.resourceGroup
+            SubscriptionId = $r.subscriptionId; SubscriptionName = $subsSeen[$r.subscriptionId]
+            Kind = $r.kind; Location = $r.location; Sku = $r.sku
+            Status = 'Pending'; Message = ''; Deployments = @{}; MetricNames = @()
+        }
+        $resById[$rk] = $o
+        $resources.Add($o)
     }
 }
 Write-Log "Candidate Cognitive Services accounts: $($resources.Count)"
 
-foreach ($res in $resources) {
-    try {
-        $defs = Invoke-Arm -Tenant $res.TenantId -Uri "$($res.Id)/providers/Microsoft.Insights/metricDefinitions?api-version=$MetricsApi&metricnamespace=Microsoft.CognitiveServices/accounts"
-        $names = @($defs.value | ForEach-Object { $_.name.value })
-        $missing = @($RequiredMetrics | Where-Object { $_ -notin $names })
-        if ($missing) { $res.Status = 'NotOpenAI'; $res.Message = "Missing metrics: $($missing -join ',')"; continue }
-    }
-    catch {
-        $code = if ($_.Exception -is [ArmException]) { $_.Exception.StatusCode } else { -1 }
-        $res.Status = if ($code -in 401, 403) { 'Forbidden' } else { 'Error' }
-        $res.Message = $_.Exception.Message; continue
-    }
-    try {
-        foreach ($d in (Get-ArmPaged $res.TenantId "$($res.Id)/deployments?api-version=2024-10-01")) {
-            $res.Deployments[$d.name] = [pscustomobject]@{
-                Model = Get-Prop $d 'properties.model.name'; Version = [string](Get-Prop $d 'properties.model.version')
-                Format = Get-Prop $d 'properties.model.format'
-                Sku = Get-Prop $d 'sku.name'; Capacity = Get-Prop $d 'sku.capacity'
-                TokensPerMinute = ConvertTo-PerMinute (Get-Prop $d 'properties.rateLimits') 'token'
-                RequestsPerMinute = ConvertTo-PerMinute (Get-Prop $d 'properties.rateLimits') 'request'
-            }
-        }
-    }
-    catch { $res.Message = "Deployments not readable: $($_.Exception.Message)" }
-    $res.Status = 'OpenAI'
+# Validate accounts and read deployments in parallel.
+Invoke-Units @($resources | ForEach-Object { [pscustomobject]@{ Type = 'Discover'; Resource = $_ } }) -Activity 'Discovery' -OnResult {
+    param($r)
+    $o = $resById[$r.Id.ToLowerInvariant()]
+    $o.Status = $r.Status; $o.Message = $r.Message; $o.Deployments = $r.Deployments; $o.MetricNames = @($r.MetricNames)
 }
+foreach ($o in $resources) { if ($o.Status -eq 'Pending') { $o.Status = 'Error'; $o.Message = 'Discovery failed (see run.log)' } }
 
 $resources | ForEach-Object {
     [pscustomobject]@{
@@ -589,19 +476,31 @@ $resources | Group-Object Status | ForEach-Object { Write-Log "Accounts $($_.Nam
 $capturedAt = Format-Utc ([datetime]::UtcNow)
 $quotaRows = [System.Collections.Generic.List[object]]::new()
 $depRows = [System.Collections.Generic.List[object]]::new()
+$quotaGroups = @{}
+foreach ($grp in ($targets | Group-Object SubscriptionId, Location)) { $quotaGroups[$grp.Name] = $grp.Group }
+$quotaData = @{}
+Invoke-Units @($quotaGroups.Keys | Sort-Object | ForEach-Object {
+        $f = $quotaGroups[$_][0]
+        [pscustomobject]@{ Type = 'Quota'; Key = $_; TenantId = $f.TenantId; SubscriptionId = $f.SubscriptionId; Location = $f.Location }
+    }) -Activity 'Quota' -OnResult { param($r) $quotaData[$r.Key] = $r }
+
 $quotaFailures = 0
-foreach ($grp in ($targets | Group-Object SubscriptionId, Location)) {
-    $first = $grp.Group[0]
-    $base = "/subscriptions/$($first.SubscriptionId)/providers/Microsoft.CognitiveServices/locations/$($first.Location)"
+foreach ($key in ($quotaGroups.Keys | Sort-Object)) {
+    $grp = $quotaGroups[$key]
+    $first = $grp[0]
+    $qd = $quotaData[$key]
     $usages = @(); $models = @()
-    try { $usages = Get-ArmPaged $first.TenantId "$base/usages?api-version=2024-10-01" }
-    catch { $quotaFailures++; Write-Log "Quota usages not readable for $($first.SubscriptionName)/$($first.Location): $($_.Exception.Message)" 'WARN' }
-    try { $models = Get-ArmPaged $first.TenantId "$base/models?api-version=2024-10-01" }
-    catch { Write-Log "Model catalog not readable for $($first.SubscriptionName)/$($first.Location): $($_.Exception.Message)" 'WARN' }
+    if (-not $qd -or $qd.UsageError) {
+        $quotaFailures++
+        Write-Log "Quota usages not readable for $($first.SubscriptionName)/$($first.Location): $(if ($qd) { $qd.UsageError } else { 'unit failed' })" 'WARN'
+    }
+    else { $usages = @($qd.Usages) }
+    if ($qd -and $qd.ModelError) { Write-Log "Model catalog not readable for $($first.SubscriptionName)/$($first.Location): $($qd.ModelError)" 'WARN' }
+    elseif ($qd) { $models = @($qd.Models) }
     $usageByName = @{}
     foreach ($u in $usages) { $usageByName[$u.name.value] = $u }
     $mapped = @{}
-    foreach ($res in $grp.Group) {
+    foreach ($res in $grp) {
         foreach ($kv in ($res.Deployments.GetEnumerator() | Sort-Object Key)) {
             $d = $kv.Value
             $qn, $qm = if ($usages.Count -or $models.Count) { Resolve-QuotaName $d $res.Kind $models $usages } else { @('', 'NoQuotaAccess') }
@@ -637,16 +536,18 @@ $quotaRows | Export-Csv -LiteralPath (Join-Path $OutputDirectory 'quota.csv') -N
 Write-Log "Quota snapshot: $($quotaRows.Count) quota row(s), $($depRows.Count) deployment(s); unmapped: $(@($depRows | Where-Object { $_.QuotaMatch -notin 'ModelsApi', 'NameMatch' }).Count)"
 if ($quotaFailures) { Write-Log "Quota not readable for $quotaFailures subscription/region pair(s): Reader at subscription scope is required." 'WARN' }
 
-[ordered]@{
+$runInfo = [ordered]@{
     Fingerprint     = $fingerprint
     RunName         = Split-Path $OutputDirectory -Leaf
     RunTimestamp    = if ($prev -and $prev['RunTimestamp']) { $prev.RunTimestamp } else { Format-Utc $RunStartedAt }
     LastRunAt       = Format-Utc ([datetime]::UtcNow)
+    AuthMode        = $AuthMode
     Tenants         = $TenantId
     FailedTenants   = @($failedTenants)
     Subscriptions   = $subsSeen.Count
     TargetResources = @($targets | ForEach-Object Id)
-} | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $RunFile -Encoding utf8NoBOM
+}
+$runInfo | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $RunFile -Encoding utf8NoBOM
 
 if ($InventoryOnly) { Write-Log "Inventory written to $ResourcesFile"; return }
 #endregion
@@ -657,137 +558,153 @@ for ($c = $StartTime; $c -lt $EndTime; $c = $c.AddHours($ChunkHours)) {
     $e = $c.AddHours($ChunkHours); if ($e -gt $EndTime) { $e = $EndTime }
     $chunks.Add([pscustomobject]@{ Start = $c; End = $e })
 }
-$totalWork = $targets.Count * $chunks.Count
-Write-Log "Extracting $($targets.Count) resource(s) x $($chunks.Count) chunk(s) x $($Calls.Count) call(s)"
 
-function Resolve-Model($Res, [string]$Dep, [string]$Ver, [string]$Region, [string]$Ts, [hashtable]$ByMinute, [hashtable]$ByChunk) {
-    # 1) model that served requests for this deployment/version/region in the same minute
-    $set = $ByMinute["$Dep|$Ver|$Region|$Ts"]
-    if ($set -and $set.Count -eq 1) { return @(@($set)[0], 'RequestsMetric') }
-    # 2) the only model seen for this deployment/version in the chunk
-    $chunkSet = $ByChunk["$Dep|$Ver"]
-    if ($chunkSet -and $chunkSet.Count -eq 1) { return @(@($chunkSet)[0], 'RequestsChunk') }
-    $cand = if ($set -and $set.Count) { $set } elseif ($chunkSet -and $chunkSet.Count) { $chunkSet } else { $null }
-    # 3) current ARM deployment, if it matches the version (and any request-side candidates)
-    $cur = $Res.Deployments[$Dep]
-    if ($cur -and ($cur.Version -eq $Ver -or [string]::IsNullOrEmpty($Ver)) -and (-not $cand -or $cand.Contains([string]$cur.Model))) {
-        return @($cur.Model, 'CurrentDeployment')
+# Only 'Success' and 'NotSupported' are terminal. 'Truncated' and 'Failed' chunks are retried; all calls of an
+# incomplete chunk are re-run because its part file is rewritten atomically. A successful chunk with rows whose
+# part file is missing is re-extracted too.
+$TerminalStatus = @('Success', 'NotSupported')
+function Get-PartName([string]$ResourceId, [datetime]$ChunkStart) { '{0}_{1:yyyyMMddHHmm}.csv' -f (Get-ResourceHash $ResourceId), $ChunkStart }
+function Test-Pending($Res, $Chunk) {
+    $cs = Format-Utc $Chunk.Start
+    $rows = 0L
+    foreach ($k in $Calls.Keys) {
+        $key = "$($Res.Id)|$cs|$k"
+        if ($done[$key] -notin $TerminalStatus) { return $true }
+        $rows += [long]$doneRows[$key]
     }
-    if ($cand) { return @((@($cand | Sort-Object) -join '|'), 'Ambiguous') }
-    return @('Unknown', 'Unknown')
+    return ($rows -gt 0 -and -not $partNames.Contains((Get-PartName $Res.Id $Chunk.Start)))
 }
 
-$sha = [System.Security.Cryptography.SHA256]::Create()
-$work = 0
-foreach ($res in $targets) {
-    $resHash = [System.BitConverter]::ToString($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($res.Id.ToLowerInvariant()))).Replace('-', '').Substring(0, 16)
-    foreach ($ch in $chunks) {
-        $work++
-        $cs = Format-Utc $ch.Start; $ce = Format-Utc $ch.End
-        Write-Progress -Activity 'Extracting Azure OpenAI metrics' -Status "$($res.Name) $cs" -PercentComplete ([int](100 * $work / [math]::Max(1, $totalWork)))
-        # Only 'Success' is terminal. 'Truncated' chunks are retried (e.g. after raising -Top) and are
-        # never counted as observed coverage by the statistics.
-        $pending = @($Calls.Keys | Where-Object { $done["$($res.Id)|$cs|$_"] -ne 'Success' })
-        if (-not $pending) { continue }
-
-        # All calls of an incomplete chunk are re-run: the part file is rewritten atomically.
-        $results = [ordered]@{}
-        foreach ($callName in $Calls.Keys) {
-            try { $results[$callName] = Get-MetricSeries $res $callName $ch.Start $ch.End }
-            catch { $results[$callName] = [string]$_.Exception.Message; Write-Log "  $($res.Name) $cs $callName FAILED: $($_.Exception.Message)" 'WARN' }
-        }
-        if ($results['Requests'] -isnot [string]) { $null = Merge-StatusCodeSeries $results['Requests'] }
-
-        # Historical ModelName from AzureOpenAIRequests (tokens metrics lack that dimension):
-        # per minute (exact) and per chunk (fallback), keyed by deployment/version[/region/minute].
-        $byMinute = @{}; $byChunk = @{}
-        if ($results['Requests'] -isnot [string]) {
-            foreach ($s in $results['Requests'].Series) {
-                $mn = $s.Dims['modelname']; if (-not $mn) { continue }
-                $d = $s.Dims['modeldeploymentname']; $vv = $s.Dims['modelversion']
-                $rg = if ($s.Dims['region']) { ($s.Dims['region'] -replace '\s', '').ToLowerInvariant() } else { $res.Location }
-                foreach ($p in $s.Data) {
-                    if (-not $p.PSObject.Properties['total'] -or $null -eq $p.total -or [double]$p.total -eq 0) { continue }
-                    $pts = ConvertTo-UtcDate $p.timeStamp
-                    if ($pts -lt $ch.Start -or $pts -ge $ch.End) { continue }
-                    $mk = "$d|$vv|$rg|$(Format-Utc $pts)"
-                    if (-not $byMinute.ContainsKey($mk)) { $byMinute[$mk] = [System.Collections.Generic.HashSet[string]]::new() }
-                    [void]$byMinute[$mk].Add($mn)
-                    if (-not $byChunk.ContainsKey("$d|$vv")) { $byChunk["$d|$vv"] = [System.Collections.Generic.HashSet[string]]::new() }
-                    [void]$byChunk["$d|$vv"].Add($mn)
-                }
-            }
-        }
-
-        $partFile = Join-Path $PartsDir ('{0}_{1:yyyyMMddHHmm}.csv' -f $resHash, $ch.Start)
-        $tmp = "$partFile.tmp"
-        $sw = [System.IO.StreamWriter]::new($tmp, $false, $Utf8)
-        $manifestLines = [System.Collections.Generic.List[string]]::new()
-        try {
-            foreach ($callName in $Calls.Keys) {
-                $r = $results[$callName]
-                if ($r -is [string]) {
-                    $manifestLines.Add((ConvertTo-CsvLine @((Format-Utc ([datetime]::UtcNow)), $res.Id, $cs, $ce, $callName, 'Failed', 0, 0, $false, $r)))
-                    continue
-                }
-                $rows = 0
-                $seen = [System.Collections.Generic.HashSet[string]]::new()
-                $aggs = if ($callName -eq 'PtuUtilization') { @('maximum', 'average') } else { @('total') }
-                foreach ($s in $r.Series) {
-                    $dep = [string]$s.Dims['modeldeploymentname']; $ver = [string]$s.Dims['modelversion']
-                    $region = if ($s.Dims['region']) { ($s.Dims['region'] -replace '\s', '').ToLowerInvariant() } else { $res.Location }
-                    $hasModelDim = $s.Dims.ContainsKey('modelname') -and $s.Dims['modelname']
-                    $cur = $res.Deployments[$dep]
-                    $depSku = if ($cur) { $cur.Sku } else { '' }
-                    $depCap = if ($cur) { $cur.Capacity } else { '' }
-                    foreach ($p in $s.Data) {
-                        $ts = ConvertTo-UtcDate $p.timeStamp
-                        if ($ts -lt $ch.Start -or $ts -ge $ch.End) { continue }   # half-open [start, end)
-                        $tsS = Format-Utc $ts
-                        $model = $null
-                        foreach ($agg in $aggs) {
-                            if (-not $p.PSObject.Properties[$agg]) { continue }
-                            $v = $p.$agg
-                            if ($null -eq $v -or [double]$v -eq 0) { continue }
-                            if ($null -eq $model) {
-                                if ($hasModelDim) { $model = $s.Dims['modelname']; $src = 'Metric' }
-                                else { $model, $src = Resolve-Model $res $dep $ver $region $tsS $byMinute $byChunk }
-                            }
-                            $aggName = $agg.Substring(0, 1).ToUpperInvariant() + $agg.Substring(1)
-                            if (-not $seen.Add("$tsS|$dep|$ver|$region|$($s.Metric)|$aggName|$model")) { continue }
-                            $sw.WriteLine((ConvertTo-CsvLine @(
-                                        $tsS, $res.SubscriptionId, $res.SubscriptionName, $res.ResourceGroup, $res.Name, $region,
-                                        $dep, $model, $ver, $s.Metric, [double]$v,
-                                        $res.TenantId, $res.Kind, $aggName, $depSku, $depCap, $src, $res.Id)))
-                            $rows++
-                        }
-                    }
-                }
-                $status = if ($r.Truncated) { 'Truncated' } else { 'Success' }
-                $manifestLines.Add((ConvertTo-CsvLine @((Format-Utc ([datetime]::UtcNow)), $res.Id, $cs, $ce, $callName, $status,
-                            $r.Series.Count, $rows, $r.Truncated, ($r.Notes -join '; '))))
-            }
-        }
-        finally { $sw.Dispose() }
-        Move-Item -LiteralPath $tmp -Destination $partFile -Force
-        Add-Content -LiteralPath $ManifestFile -Value $manifestLines -Encoding utf8NoBOM
-        foreach ($callName in $Calls.Keys) {
-            $done["$($res.Id)|$cs|$callName"] = if ($results[$callName] -is [string]) { 'Failed' } elseif ($results[$callName].Truncated) { 'Truncated' } else { 'Success' }
+if ($MetricsApiMode -eq 'Batch' -and $targets.Count) {
+    foreach ($t in @($targets | ForEach-Object TenantId | Sort-Object -Unique)) {
+        try { $null = Get-AccessToken $t $MetricsAudience }
+        catch {
+            Write-Log "No token for $MetricsAudience in tenant ${t}: $($_.Exception.Message). Using the ARM metrics API for it." 'WARN'
+            foreach ($r in @($targets | Where-Object TenantId -eq $t)) { Set-BatchUnavailable "$($r.SubscriptionId)|$($r.Location)".ToLowerInvariant() 'No metrics token' }
         }
     }
 }
-$sha.Dispose()
-Write-Progress -Activity 'Extracting Azure OpenAI metrics' -Completed
+
+# Batches: resources of the same tenant + subscription + region, sized so the most expensive call
+# (Requests: deployments x status codes) stays within the points-per-response budget.
+$seriesBudget = [math]::Max(1, [math]::Floor($MaxPointsPerResponse / ($ChunkHours * 60)))
+$batches = [System.Collections.Generic.List[object]]::new()
+foreach ($grp in ($targets | Sort-Object Id | Group-Object TenantId, SubscriptionId, Location)) {
+    $cur = [System.Collections.Generic.List[object]]::new(); $est = 0
+    foreach ($r in $grp.Group) {
+        $e = 4 * [math]::Max(1, $r.Deployments.Count)
+        $limit = if ($MetricsApiMode -eq 'Batch') { $MaxBatchResources } else { 1 }
+        if ($cur.Count -and ($cur.Count -ge $limit -or $est + $e -gt $seriesBudget)) { $batches.Add($cur.ToArray()); $cur.Clear(); $est = 0 }
+        $cur.Add($r); $est += $e
+    }
+    if ($cur.Count) { $batches.Add($cur.ToArray()) }
+}
+
+$idleIds = [System.Collections.Generic.HashSet[string]]::new()
+$idleManifest = 0
+if (-not $NoSkipIdle) {
+    # Pre-flight in up-to-50-resource batches (no dimensions, so there is no series budget to respect).
+    $pfUnits = [System.Collections.Generic.List[object]]::new()
+    foreach ($grp in ($targets | Sort-Object Id | Group-Object TenantId, SubscriptionId, Location)) {
+        $pend = @($grp.Group | Where-Object { $r = $_; @($chunks | Where-Object { Test-Pending $r $_ }).Count })
+        for ($i = 0; $i -lt $pend.Count; $i += $MaxBatchResources) {
+            $pfUnits.Add([pscustomobject]@{ Type = 'Preflight'; Resources = @($pend[$i..([math]::Min($i + $MaxBatchResources, $pend.Count) - 1)]); From = $StartTime; To = $EndTime })
+        }
+    }
+    Invoke-Units $pfUnits.ToArray() -Activity 'Idle pre-flight' -OnResult { param($r) foreach ($id in $r.Idle) { [void]$idleIds.Add($id) } }
+    $lines = [System.Collections.Generic.List[string]]::new()
+    foreach ($r in $targets) {
+        if (-not $idleIds.Contains($r.Id.ToLowerInvariant())) { continue }
+        foreach ($ch in $chunks) {
+            $cs = Format-Utc $ch.Start
+            if (-not (Test-Pending $r $ch)) { continue }
+            $stale = Join-Path $PartsDir (Get-PartName $r.Id $ch.Start)
+            if (Test-Path -LiteralPath $stale) { Remove-Item -LiteralPath $stale -Force }
+            [void]$partNames.Remove((Get-PartName $r.Id $ch.Start))
+            foreach ($k in $Calls.Keys) {
+                $lines.Add((ConvertTo-CsvLine @((Format-Utc ([datetime]::UtcNow)), $r.Id, $cs, (Format-Utc $ch.End), $k, 'Success', 0, 0, $false, 'Idle (pre-flight)')))
+                $done["$($r.Id)|$cs|$k"] = 'Success'; $doneRows["$($r.Id)|$cs|$k"] = 0
+            }
+        }
+    }
+    if ($lines.Count) { Add-Content -LiteralPath $ManifestFile -Value $lines -Encoding utf8NoBOM }
+    $idleManifest = $lines.Count
+    Write-Log "Idle pre-flight: $($idleIds.Count) of $($targets.Count) account(s) had no activity in the window"
+}
+
+$units = [System.Collections.Generic.List[object]]::new()
+foreach ($ch in $chunks) {
+    foreach ($b in $batches) {
+        $pend = @($b | Where-Object { Test-Pending $_ $ch })
+        if ($pend.Count) { $units.Add([pscustomobject]@{ Type = 'Extract'; Resources = $pend; Chunk = $ch }) }
+    }
+}
+Write-Log "Extracting $($targets.Count) resource(s) x $($chunks.Count) chunk(s) x $($Calls.Count) call(s): $($units.Count) work unit(s) in $($batches.Count) batch(es)"
+$extractClock = [System.Diagnostics.Stopwatch]::StartNew()
+$extractRows = 0L
+Invoke-Units $units.ToArray() -Activity 'Extraction' -OnResult {
+    param($r)
+    if ($r.Manifest.Count) { Add-Content -LiteralPath $ManifestFile -Value $r.Manifest -Encoding utf8NoBOM }
+    foreach ($k in $r.Status.Keys) { $done[$k] = $r.Status[$k]; $doneRows[$k] = [long]$r.RowsBy[$k] }
+    foreach ($p in $r.Parts) { [void]$partNames.Add($p) }
+    $script:extractRows += $r.Rows
+} -OnError {
+    # A unit that failed as a whole still leaves a 'Failed' trace for each of its calls, so the run is
+    # reported incomplete and the next resume retries it.
+    param($r)
+    $now = Format-Utc ([datetime]::UtcNow); $cs = Format-Utc $r.Unit.Chunk.Start; $ce = Format-Utc $r.Unit.Chunk.End
+    $msg = ($r.Error -split "`n")[0]
+    $lines = foreach ($res in $r.Unit.Resources) {
+        foreach ($k in $Calls.Keys) { ConvertTo-CsvLine @($now, $res.Id, $cs, $ce, $k, 'Failed', 0, 0, $false, $msg); $done["$($res.Id)|$cs|$k"] = 'Failed' }
+    }
+    Add-Content -LiteralPath $ManifestFile -Value @($lines) -Encoding utf8NoBOM
+}
+$extractClock.Stop()
 #endregion
 
 #region merge -----------------------------------------------------------------------------------
+# Only chunks whose calls all completed ('Success', or 'Truncated' = flagged partial data) in the latest
+# manifest are merged: a part left behind by an interrupted or failed unit never leaks into the final CSV.
+$latest = @{}
+foreach ($m in (Import-Csv $ManifestFile)) { $latest["$($m.ResourceId)|$($m.ChunkStart)|$($m.Call)"] = $m }
+$chunkOk = @{}
+foreach ($m in $latest.Values) {
+    $ck = "$($m.ResourceId)|$($m.ChunkStart)"
+    if (-not $chunkOk.ContainsKey($ck)) { $chunkOk[$ck] = $true }
+    if ($m.Status -notin 'Success', 'Truncated', 'NotSupported') { $chunkOk[$ck] = $false }
+}
+$mergeable = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+foreach ($ck in $chunkOk.Keys) {
+    if (-not $chunkOk[$ck]) { continue }
+    $rid, $cs = $ck.Split('|', 2)
+    if (@($Calls.Keys | Where-Object { -not $latest.ContainsKey("$ck|$_") }).Count) { continue }
+    [void]$mergeable.Add((Get-PartName $rid (ConvertTo-UtcDate $cs)))
+}
+
+# Completeness: every target x chunk x call must have a latest 'Success' entry, and every successful chunk
+# with rows must have its part file.
+$missing = 0; $bad = 0; $noPart = 0
+foreach ($r in $targets) {
+    foreach ($ch in $chunks) {
+        $cs = Format-Utc $ch.Start
+        $rows = 0L
+        foreach ($k in $Calls.Keys) {
+            $m = $latest["$($r.Id)|$cs|$k"]
+            if (-not $m) { $missing++ } elseif ($m.Status -notin $TerminalStatus) { $bad++ } else { $rows += [long]$m.Rows }
+        }
+        if ($rows -gt 0 -and -not $partNames.Contains((Get-PartName $r.Id $ch.Start))) { $noPart++ }
+    }
+}
+
 Write-Log 'Merging part files'
 $tmpOut = "$OutputCsv.tmp"
 $out = [System.IO.StreamWriter]::new($tmpOut, $false, $Utf8)
 $total = 0L
+$skippedParts = 0
 try {
     $out.WriteLine(($CsvColumns -join ','))
     foreach ($f in (Get-ChildItem -LiteralPath $PartsDir -File | Where-Object Extension -eq '.csv' | Sort-Object Name)) {
+        if (-not $mergeable.Contains($f.Name)) { $skippedParts++; continue }
         $reader = [System.IO.StreamReader]::new($f.FullName, $Utf8)
         try { while ($null -ne ($line = $reader.ReadLine())) { if ($line) { $out.WriteLine($line); $total++ } } }
         finally { $reader.Dispose() }
@@ -796,10 +713,45 @@ try {
 finally { $out.Dispose() }
 Move-Item -LiteralPath $tmpOut -Destination $OutputCsv -Force
 
-$latest = @{}
-foreach ($m in (Import-Csv $ManifestFile)) { $latest["$($m.ResourceId)|$($m.ChunkStart)|$($m.Call)"] = $m.Status }
-$bad = @($latest.GetEnumerator() | Where-Object { $_.Value -ne 'Success' })
-Write-Log "Done. Rows: $total -> $OutputCsv"
+$limiterStats = [ordered]@{}
+foreach ($kv in ($Limiters.Snapshot() | Sort-Object Key)) {
+    $limiterStats[$kv.Key] = [ordered]@{ Calls = $kv.Value.Calls; Throttles = $kv.Value.Throttles; Slowdowns = $kv.Value.Slowdowns
+        FinalRate = [math]::Round($kv.Value.Rate, 2); PeakRate = [math]::Round($kv.Value.PeakRate, 2); LowestRate = [math]::Round($kv.Value.LowRate, 2) }
+}
+$runInfo['LastRunAt'] = Format-Utc ([datetime]::UtcNow)
+$runInfo['Completeness'] = [ordered]@{
+    Status          = if ($missing + $bad + $noPart -eq 0) { 'Complete' } else { 'Incomplete' }
+    ExpectedCalls   = $targets.Count * $chunks.Count * $Calls.Count
+    MissingCalls    = $missing
+    NotSuccessful   = $bad
+    MissingParts    = $noPart
+    SkippedParts    = $skippedParts
+}
+$runInfo['Performance'] = [ordered]@{
+    MetricsApi          = $MetricsApiMode
+    Parallel            = $Parallel
+    SkipIdle            = -not $NoSkipIdle
+    DurationSeconds     = [math]::Round($script:RunClock.Elapsed.TotalSeconds, 1)
+    ExtractionSeconds   = [math]::Round($extractClock.Elapsed.TotalSeconds, 1)
+    WorkUnits           = $units.Count
+    Batches             = $batches.Count
+    MaxBatchSize        = ($batches | ForEach-Object { $_.Count } | Measure-Object -Maximum).Maximum
+    SeriesBudget        = $seriesBudget
+    IdleAccounts        = $idleIds.Count
+    IdleManifestRows    = $idleManifest
+    BatchCapability     = [ordered]@{}
+    Requests            = $limiterStats
+}
+foreach ($k in ($BatchCap.Keys | Sort-Object)) {
+    $reason = $null; [void]$BatchCapReason.TryGetValue($k, [ref]$reason)
+    $runInfo.Performance.BatchCapability[$k] = if ($reason) { "$($BatchCap[$k]) ($reason)" } else { $BatchCap[$k] }
+}
+$runInfo | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $RunFile -Encoding utf8NoBOM
+
+$thr = ($Limiters.Snapshot() | Where-Object { $_.Key -in 'arm-global', 'batch-global' } | ForEach-Object { $_.Value.Throttles } | Measure-Object -Sum).Sum
+Write-Log ("Done in {0:N0} s (extraction {1:N0} s, {2} unit(s), throttle events {3}). Rows: {4} -> {5}" -f $script:RunClock.Elapsed.TotalSeconds, $extractClock.Elapsed.TotalSeconds, $units.Count, $thr, $total, $OutputCsv)
 if ($failedTenants.Count) { Write-Log "Tenants not accessible (run 'az login --tenant <id>' and re-run with the same -OutputDirectory): $($failedTenants -join ', ')" 'WARN' }
-if ($bad.Count) { Write-Log "$($bad.Count) call(s) not successful (see manifest.csv). Re-run with the same -OutputDirectory to retry failed ones." 'WARN' }
+if ($bad -or $missing -or $noPart) { Write-Log "Run incomplete: $bad call(s) not successful, $missing call(s) never recorded, $noPart part file(s) missing (see manifest.csv). Re-run with the same -OutputDirectory to retry them." 'WARN' }
+if ($skippedParts) { Write-Log "$skippedParts part file(s) of incomplete chunks were not merged" 'WARN' }
+$RunLock.Dispose()
 #endregion
