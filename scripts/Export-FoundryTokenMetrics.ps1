@@ -89,8 +89,9 @@
     per-resource ARM metrics API only.
 
 .PARAMETER Parallel
-    Number of concurrent workers (1-32, default 6). Request rates are still bounded by the adaptive
-    rate limiters, so raising it never bypasses throttling protection.
+    Number of concurrent workers (1-32, default 12). Request rates are still bounded by the adaptive
+    rate limiters, so raising it never bypasses throttling protection. 12 is an empirically conservative
+    default (no throttling observed in tests), not a guarantee for every estate.
 
 .PARAMETER NoSkipIdle
     Disable the idle pre-flight and query every account per minute.
@@ -136,7 +137,7 @@ param(
     [ValidateRange(1, 10)] [int] $MaxRetries = 6,
     [ValidateRange(10, 600)] [int] $TokenTimeoutSeconds = 60,
     [ValidateSet('Batch', 'Arm')] [string] $MetricsApi = 'Batch',
-    [ValidateRange(1, 32)] [int] $Parallel = 6,
+    [ValidateRange(1, 32)] [int] $Parallel = 12,
     [switch]   $NoSkipIdle,
     [ValidateRange(10000, 5000000)] [int] $MaxPointsPerResponse = 500000,
     [ValidateSet('Auto', 'AzCli', 'AzPowerShell', 'ManagedIdentity')] [string] $AuthMode = 'Auto',
@@ -181,6 +182,7 @@ $RequiredMetrics = @('ProcessedPromptTokens', 'GeneratedTokens', 'AzureOpenAIReq
 
 # Shared (thread-safe) state, passed by reference to every worker runspace.
 $TokenCache = [System.Collections.Concurrent.ConcurrentDictionary[string, object]]::new()
+$TokenFailures = @{}   # coordinator only: tenant|audience -> error of the start-up token prefetch
 $BatchCap = [System.Collections.Concurrent.ConcurrentDictionary[string, string]]::new()
 $BatchCapReason = [System.Collections.Concurrent.ConcurrentDictionary[string, string]]::new()
 $CanRefreshTokens = $true
@@ -219,31 +221,56 @@ function Invoke-ResourceGraph([string]$Tenant, [string[]]$Subscriptions, [string
 
 function Get-NormName([string]$s) { ($s -replace '[^A-Za-z0-9]', '').ToLowerInvariant() }
 
+# Model catalog index for one subscription + region, built once: model name -> entries (version, kind, SKUs).
+function New-ModelIndex($Models) {
+    $idx = @{}   # case-insensitive, like the -ne comparison it replaces
+    foreach ($m in $Models) {
+        $n = Get-Prop $m 'model.name'
+        $key = if ($null -eq $n) { "`0" } else { [string]$n }
+        $skus = [System.Collections.Generic.List[object]]::new()
+        foreach ($sku in @(Get-Prop $m 'model.skus')) {
+            if (-not $sku) { continue }
+            $un = Get-Prop $sku 'usageName'
+            if (-not $un) { continue }
+            $skus.Add([pscustomobject]@{ Name = Get-Prop $sku 'name'; UsageName = $un; IsFt = [bool]($un -match '-finetune$') })
+        }
+        if (-not $idx.ContainsKey($key)) { $idx[$key] = [System.Collections.Generic.List[object]]::new() }
+        $idx[$key].Add([pscustomobject]@{ Version = [string](Get-Prop $m 'model.version'); Kind = Get-Prop $m 'kind'; Skus = $skus })
+    }
+    return $idx
+}
+
+# Usage (quota) names split once: '<prefix>.<Sku>[.<model>]'.
+function New-UsageIndex($Usages) {
+    @(foreach ($u in $Usages) {
+            $name = $u.name.value
+            $p = $name.Split('.', 3)
+            [pscustomobject]@{ Name = $name; Count = $p.Count; Sku = if ($p.Count -ge 2) { $p[1] } else { $null }; Norm = if ($p.Count -eq 3) { Get-NormName $p[2] } else { $null } }
+        })
+}
+
 # Maps a deployment to the subscription/region quota (usage) it consumes.
 #   ModelsApi : exact usageName from the regional models catalog (model + version + SKU + kind)
 #   NameMatch : fallback on '<prefix>.<Sku>.<model>' with punctuation-insensitive model name
-function Resolve-QuotaName($Dep, [string]$AccountKind, $Models, $Usages) {
+function Resolve-QuotaName($Dep, [string]$AccountKind, [hashtable]$ModelIndex, [object[]]$UsageIndex) {
     $isFt = $Dep.Model -match '\.ft-|-ft-|finetune'
+    $entries = $ModelIndex[$(if ($null -eq $Dep.Model) { "`0" } else { [string]$Dep.Model })]
     foreach ($strictKind in $true, $false) {
-        $names = @(@(foreach ($m in $Models) {
-                if ((Get-Prop $m 'model.name') -ne $Dep.Model) { continue }
-                $v = [string](Get-Prop $m 'model.version')
-                if ($Dep.Version -and $v -and $v -ne $Dep.Version) { continue }
-                if ($strictKind -and (Get-Prop $m 'kind') -ne $AccountKind) { continue }
-                foreach ($sku in @(Get-Prop $m 'model.skus')) {
-                    if (-not $sku -or $sku.name -ne $Dep.Sku -or -not (Get-Prop $sku 'usageName')) { continue }
-                    if (($sku.usageName -match '-finetune$') -ne $isFt) { continue }
-                    $sku.usageName
-                }
-            }) | Sort-Object -Unique)
+        $names = @(@(foreach ($m in $entries) {
+                    if ($Dep.Version -and $m.Version -and $m.Version -ne $Dep.Version) { continue }
+                    if ($strictKind -and $m.Kind -ne $AccountKind) { continue }
+                    foreach ($sku in $m.Skus) {
+                        if ($sku.Name -ne $Dep.Sku -or $sku.IsFt -ne $isFt) { continue }
+                        $sku.UsageName
+                    }
+                }) | Sort-Object -Unique)
         if ($names.Count -eq 1) { return @($names[0], 'ModelsApi') }
         if ($names.Count -gt 1) { return @(($names -join '|'), 'Ambiguous') }
     }
     $nm = Get-NormName $Dep.Model
-    $hits = @($Usages | ForEach-Object { $_.name.value } | Where-Object {
-            $p = $_.Split('.', 3)
-            $p.Count -ge 2 -and $p[1] -eq $Dep.Sku -and (($p.Count -eq 2 -and $Dep.Sku -match 'Provisioned') -or ($p.Count -eq 3 -and (Get-NormName $p[2]) -eq $nm))
-        } | Sort-Object -Unique)
+    $hits = @(@(foreach ($u in $UsageIndex) {
+                if ($u.Count -ge 2 -and $u.Sku -eq $Dep.Sku -and (($u.Count -eq 2 -and $Dep.Sku -match 'Provisioned') -or ($u.Count -eq 3 -and $u.Norm -eq $nm))) { $u.Name }
+            }) | Sort-Object -Unique)
     if ($hits.Count -eq 1) { return @($hits[0], 'NameMatch') }
     if ($hits.Count -gt 1) { return @(($hits -join '|'), 'Ambiguous') }
     return @('', 'Unmapped')
@@ -254,10 +281,16 @@ function Resolve-QuotaName($Dep, [string]$AccountKind, $Models, $Usages) {
 function Update-TokenCache {
     $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
     foreach ($k in @($TokenCache.Keys)) {
-        if (($TokenCache[$k].ExpiresOn - $now) -ge 1200 -and -not $TokenCache[$k].Rejected) { continue }
+        $c = $TokenCache[$k]
+        if (($c.ExpiresOn - $now) -ge 1200 -and -not $c.Rejected) { continue }
         $t, $a = $k.Split('|', 2)
-        try { $null = Get-AccessToken $t $a -Force } catch { $TokenCache[$k].Rejected = $false; Write-Log "Token refresh failed for ${k}: $($_.Exception.Message)" 'WARN' }
+        try { $null = Get-AccessToken $t $a -Force } catch { $c.ClearRejected(); Write-Log "Token refresh failed for ${k}: $($_.Exception.Message)" 'WARN' }
     }
+}
+
+function Test-TokenRejected {
+    foreach ($c in $TokenCache.Values) { if ($c.Rejected) { return $true } }
+    return $false
 }
 
 $WorkerBlock = {
@@ -273,7 +306,10 @@ $WorkerBlock = {
     $MetricsApiMode = $using:MetricsApiMode; $PartsDir = $using:PartsDir; $AzExe = $using:AzExe
     $AuthMode = $using:AuthMode; $ManagedIdentityClientId = $using:ManagedIdentityClientId
     $CanRefreshTokens = $false
-    . $using:CommonFile
+    # Reused runspaces keep the functions of the shared library but not its variables: load it once per
+    # runspace and only re-create the constants afterwards.
+    if (Get-Command Invoke-WorkUnit -CommandType Function -ErrorAction SilentlyContinue) { . Initialize-FiConstants }
+    else { . $using:CommonFile }
     try { $r = Invoke-WorkUnit $U }
     catch { $r = [pscustomobject]@{ Type = 'Error'; Unit = $U; Error = "$($_.Exception.Message) @ $($_.InvocationInfo.PositionMessage)" } }
     $r | Add-Member -NotePropertyName Logs -NotePropertyValue $logs -Force
@@ -301,7 +337,7 @@ function Invoke-Units([object[]]$Units, [scriptblock]$OnResult, [scriptblock]$On
             }
             foreach ($e in @($jobErr)) { if ($e) { Write-Log "$Activity worker error: $e" 'WARN' } }
             $el = $sw.Elapsed.TotalSeconds
-            if ($el - $lastRefresh -ge 60 -or @($TokenCache.Values | Where-Object Rejected).Count) { $lastRefresh = $el; Update-TokenCache }
+            if ($el - $lastRefresh -ge 60 -or (Test-TokenRejected)) { $lastRefresh = $el; Update-TokenCache }
             if ($n -and ($n -eq $Units.Count -or $el - $lastLog -ge 30)) {
                 $lastLog = $el
                 $eta = if ($n -lt $Units.Count) { [timespan]::FromSeconds($el / $n * ($Units.Count - $n)).ToString('hh\:mm\:ss') } else { '00:00:00' }
@@ -398,11 +434,17 @@ Write-Log "Window $(Format-Utc $StartTime) -> $(Format-Utc $EndTime) ($Interval,
 #endregion
 
 #region discovery -------------------------------------------------------------------------------
+$ArmAudience = "$Arm/"
+$tokenAudiences = @($ArmAudience)
 if (-not $TenantId) {
     # Home tenant of the signed-in identity lists every tenant it belongs to.
     $TenantId = @(Get-ArmPaged '' '/tenants?api-version=2022-12-01' | ForEach-Object { $_.tenantId } | Where-Object { $_ } | Sort-Object -Unique)
 }
 Write-Log "Tenants to process: $($TenantId.Count) (auth: $AuthMode)"
+# Every tenant x audience token up front, a few 'az' processes at a time instead of one after another.
+$tokenClock = [System.Diagnostics.Stopwatch]::StartNew()
+Initialize-Tokens $TenantId $tokenAudiences
+Write-Log ("Tokens: {0} ok, {1} failed in {2:N1} s" -f ($TenantId.Count * $tokenAudiences.Count - $TokenFailures.Count), $TokenFailures.Count, $tokenClock.Elapsed.TotalSeconds)
 
 $subsSeen = @{}
 $tenantSubs = [ordered]@{}
@@ -479,10 +521,20 @@ $depRows = [System.Collections.Generic.List[object]]::new()
 $quotaGroups = @{}
 foreach ($grp in ($targets | Group-Object SubscriptionId, Location)) { $quotaGroups[$grp.Name] = $grp.Group }
 $quotaData = @{}
-Invoke-Units @($quotaGroups.Keys | Sort-Object | ForEach-Object {
-        $f = $quotaGroups[$_][0]
-        [pscustomobject]@{ Type = 'Quota'; Key = $_; TenantId = $f.TenantId; SubscriptionId = $f.SubscriptionId; Location = $f.Location }
-    }) -Activity 'Quota' -OnResult { param($r) $quotaData[$r.Key] = $r }
+foreach ($k in $quotaGroups.Keys) {
+    $quotaData[$k] = [pscustomobject]@{ Usages = @(); Models = @(); UsageError = 'unit failed'; ModelError = 'unit failed' }
+}
+# Usages and the models catalog are independent requests: two units per subscription + region.
+Invoke-Units @(foreach ($k in ($quotaGroups.Keys | Sort-Object)) {
+        $f = $quotaGroups[$k][0]
+        foreach ($part in 'Usages', 'Models') {
+            [pscustomobject]@{ Type = 'Quota'; Part = $part; Key = $k; TenantId = $f.TenantId; SubscriptionId = $f.SubscriptionId; Location = $f.Location }
+        }
+    }) -Activity 'Quota' -OnResult {
+    param($r)
+    $q = $quotaData[$r.Key]
+    if ($r.Part -eq 'Usages') { $q.Usages = $r.Items; $q.UsageError = $r.Error } else { $q.Models = $r.Items; $q.ModelError = $r.Error }
+}
 
 $quotaFailures = 0
 foreach ($key in ($quotaGroups.Keys | Sort-Object)) {
@@ -490,20 +542,22 @@ foreach ($key in ($quotaGroups.Keys | Sort-Object)) {
     $first = $grp[0]
     $qd = $quotaData[$key]
     $usages = @(); $models = @()
-    if (-not $qd -or $qd.UsageError) {
+    if ($qd.UsageError) {
         $quotaFailures++
-        Write-Log "Quota usages not readable for $($first.SubscriptionName)/$($first.Location): $(if ($qd) { $qd.UsageError } else { 'unit failed' })" 'WARN'
+        Write-Log "Quota usages not readable for $($first.SubscriptionName)/$($first.Location): $($qd.UsageError)" 'WARN'
     }
     else { $usages = @($qd.Usages) }
-    if ($qd -and $qd.ModelError) { Write-Log "Model catalog not readable for $($first.SubscriptionName)/$($first.Location): $($qd.ModelError)" 'WARN' }
-    elseif ($qd) { $models = @($qd.Models) }
+    if ($qd.ModelError) { Write-Log "Model catalog not readable for $($first.SubscriptionName)/$($first.Location): $($qd.ModelError)" 'WARN' }
+    else { $models = @($qd.Models) }
+    $modelIndex = New-ModelIndex $models
+    $usageIndex = @(New-UsageIndex $usages)
     $usageByName = @{}
     foreach ($u in $usages) { $usageByName[$u.name.value] = $u }
     $mapped = @{}
     foreach ($res in $grp) {
         foreach ($kv in ($res.Deployments.GetEnumerator() | Sort-Object Key)) {
             $d = $kv.Value
-            $qn, $qm = if ($usages.Count -or $models.Count) { Resolve-QuotaName $d $res.Kind $models $usages } else { @('', 'NoQuotaAccess') }
+            $qn, $qm = if ($usages.Count -or $models.Count) { Resolve-QuotaName $d $res.Kind $modelIndex $usageIndex } else { @('', 'NoQuotaAccess') }
             $u = if ($qn) { $usageByName[$qn] } else { $null }
             if ($u) { $mapped[$qn] = $true }
             $depRows.Add([pscustomobject]@{
@@ -576,7 +630,9 @@ function Test-Pending($Res, $Chunk) {
 }
 
 if ($MetricsApiMode -eq 'Batch' -and $targets.Count) {
-    foreach ($t in @($targets | ForEach-Object TenantId | Sort-Object -Unique)) {
+    $targetTenants = @($targets | ForEach-Object TenantId | Sort-Object -Unique)
+    Initialize-Tokens $targetTenants @($MetricsAudience)
+    foreach ($t in $targetTenants) {
         try { $null = Get-AccessToken $t $MetricsAudience }
         catch {
             Write-Log "No token for $MetricsAudience in tenant ${t}: $($_.Exception.Message). Using the ARM metrics API for it." 'WARN'
@@ -606,9 +662,12 @@ if (-not $NoSkipIdle) {
     # Pre-flight in up-to-50-resource batches (no dimensions, so there is no series budget to respect).
     $pfUnits = [System.Collections.Generic.List[object]]::new()
     foreach ($grp in ($targets | Sort-Object Id | Group-Object TenantId, SubscriptionId, Location)) {
-        $pend = @($grp.Group | Where-Object { $r = $_; @($chunks | Where-Object { Test-Pending $r $_ }).Count })
+        $pend = [System.Collections.Generic.List[object]]::new()
+        foreach ($r in $grp.Group) {
+            foreach ($ch in $chunks) { if (Test-Pending $r $ch) { $pend.Add($r); break } }
+        }
         for ($i = 0; $i -lt $pend.Count; $i += $MaxBatchResources) {
-            $pfUnits.Add([pscustomobject]@{ Type = 'Preflight'; Resources = @($pend[$i..([math]::Min($i + $MaxBatchResources, $pend.Count) - 1)]); From = $StartTime; To = $EndTime })
+            $pfUnits.Add([pscustomobject]@{ Type = 'Preflight'; Resources = $pend.GetRange($i, [math]::Min($MaxBatchResources, $pend.Count - $i)).ToArray(); From = $StartTime; To = $EndTime })
         }
     }
     Invoke-Units $pfUnits.ToArray() -Activity 'Idle pre-flight' -OnResult { param($r) foreach ($id in $r.Idle) { [void]$idleIds.Add($id) } }
@@ -627,7 +686,7 @@ if (-not $NoSkipIdle) {
             }
         }
     }
-    if ($lines.Count) { Add-Content -LiteralPath $ManifestFile -Value $lines -Encoding utf8NoBOM }
+    if ($lines.Count) { [System.IO.File]::AppendAllLines($ManifestFile, $lines, $Utf8) }
     $idleManifest = $lines.Count
     Write-Log "Idle pre-flight: $($idleIds.Count) of $($targets.Count) account(s) had no activity in the window"
 }
@@ -635,16 +694,19 @@ if (-not $NoSkipIdle) {
 $units = [System.Collections.Generic.List[object]]::new()
 foreach ($ch in $chunks) {
     foreach ($b in $batches) {
-        $pend = @($b | Where-Object { Test-Pending $_ $ch })
-        if ($pend.Count) { $units.Add([pscustomobject]@{ Type = 'Extract'; Resources = $pend; Chunk = $ch }) }
+        $pend = [System.Collections.Generic.List[object]]::new(); $cost = 0
+        foreach ($r in $b) { if (Test-Pending $r $ch) { $pend.Add($r); $cost += 4 * [math]::Max(1, $r.Deployments.Count) } }
+        if ($pend.Count) { $units.Add([pscustomobject]@{ Type = 'Extract'; Resources = $pend.ToArray(); Chunk = $ch; Cost = $cost; Order = $units.Count }) }
     }
 }
+# Most expensive units first, so the slowest ones do not end up alone at the tail of the run.
+$units = [System.Collections.Generic.List[object]]@($units | Sort-Object @{ Expression = 'Cost'; Descending = $true }, @{ Expression = 'Order'; Ascending = $true })
 Write-Log "Extracting $($targets.Count) resource(s) x $($chunks.Count) chunk(s) x $($Calls.Count) call(s): $($units.Count) work unit(s) in $($batches.Count) batch(es)"
 $extractClock = [System.Diagnostics.Stopwatch]::StartNew()
 $extractRows = 0L
 Invoke-Units $units.ToArray() -Activity 'Extraction' -OnResult {
     param($r)
-    if ($r.Manifest.Count) { Add-Content -LiteralPath $ManifestFile -Value $r.Manifest -Encoding utf8NoBOM }
+    if ($r.Manifest.Count) { [System.IO.File]::AppendAllLines($ManifestFile, [string[]]$r.Manifest, $Utf8) }
     foreach ($k in $r.Status.Keys) { $done[$k] = $r.Status[$k]; $doneRows[$k] = [long]$r.RowsBy[$k] }
     foreach ($p in $r.Parts) { [void]$partNames.Add($p) }
     $script:extractRows += $r.Rows
@@ -657,7 +719,7 @@ Invoke-Units $units.ToArray() -Activity 'Extraction' -OnResult {
     $lines = foreach ($res in $r.Unit.Resources) {
         foreach ($k in $Calls.Keys) { ConvertTo-CsvLine @($now, $res.Id, $cs, $ce, $k, 'Failed', 0, 0, $false, $msg); $done["$($res.Id)|$cs|$k"] = 'Failed' }
     }
-    Add-Content -LiteralPath $ManifestFile -Value @($lines) -Encoding utf8NoBOM
+    [System.IO.File]::AppendAllLines($ManifestFile, [string[]]@($lines), $Utf8)
 }
 $extractClock.Stop()
 #endregion
@@ -705,9 +767,7 @@ try {
     $out.WriteLine(($CsvColumns -join ','))
     foreach ($f in (Get-ChildItem -LiteralPath $PartsDir -File | Where-Object Extension -eq '.csv' | Sort-Object Name)) {
         if (-not $mergeable.Contains($f.Name)) { $skippedParts++; continue }
-        $reader = [System.IO.StreamReader]::new($f.FullName, $Utf8)
-        try { while ($null -ne ($line = $reader.ReadLine())) { if ($line) { $out.WriteLine($line); $total++ } } }
-        finally { $reader.Dispose() }
+        $total += [FoundryInsights.Csv]::AppendLines($f.FullName, $out, $Utf8)
     }
 }
 finally { $out.Dispose() }

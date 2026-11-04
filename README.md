@@ -74,7 +74,7 @@ pwsh -File .\scripts\Export-FoundryTokenMetrics.ps1 -TenantId <tenantId> -Days 1
 | `-Top` | 1000 | Series limit per call. If reached, the query is repeated per deployment to avoid truncation. |
 | `-TokenTimeoutSeconds` | 60 | Maximum time to get a tenant token. Tenants that require interactive login (MFA/CA) are flagged as failed and the others continue. |
 | `-MetricsApi` | `Batch` | `Batch` uses the regional `metrics:getBatch` data-plane API (up to 50 accounts of the same subscription and region per call). `Arm` forces the classic per-resource API. Both produce identical CSVs. |
-| `-Parallel` | 6 | Concurrent workers (1–32). Requests are paced by shared rate limiters, so raising it only helps while latency, not the limiters, is the bottleneck. |
+| `-Parallel` | 12 | Concurrent workers (1–32). Requests are paced by shared rate limiters, so raising it only helps while latency, not the limiters, is the bottleneck. |
 | `-NoSkipIdle` | off | Disables the idle pre-flight (see below) and extracts every chunk of every account. |
 | `-MaxPointsPerResponse` | 500000 | Budget used to size getBatch batches (series × minutes per response). Oversized requests (413) are halved automatically. |
 | `-MaxRetries` | 6 | Retries per request for 429/5xx/transport errors. |
@@ -87,10 +87,13 @@ The extractor is built for large estates:
 - **Parallel workers** (`-Parallel`) share **adaptive rate limiters** (token buckets): global and per subscription/region for getBatch; global, per subscription and metrics-per-subscription for ARM; and Resource Graph. Each bucket increases its rate gradually after clean calls and halves it on `429`/`503`/`529`. A throttled response pauses every worker that shares the bucket (honouring `Retry-After`), and a low `x-ms-ratelimit-remaining-subscription-reads` header slows down the bucket before throttling happens.
 - **Idle pre-flight:** one coarse daily query per batch over the whole window. Accounts with no tokens, requests (or PTU utilization) at all are recorded as `Success` / `Idle (pre-flight)` without querying every chunk. Any doubt (missing metric, error) keeps the account in the full extraction.
 - **Latency only where there is traffic:** the latency/availability call is only made for accounts and chunks with requests, filtered to the deployments that had traffic.
-- Discovery and quota calls also run in parallel; tokens are refreshed in the background during long runs.
+- Discovery and quota calls also run in parallel (quota usages and the models catalog are separate units); tokens are refreshed in the background during long runs.
+- **Token prefetch:** all tenant tokens are requested up front, a few `az` processes at a time, each with its own deadline. A tenant that fails is recorded once and not retried by every call.
+- **Fast parsing and writing:** metrics responses are parsed by a compiled .NET (`System.Text.Json`) parser instead of `ConvertFrom-Json`, and CSV lines, manifest appends and the final merge use .NET streams. Workers reuse the library loaded in their runspace.
+- **Cost-ordered work:** extraction units are scheduled from the most to the least expensive (deployments × calls), so large batches do not end up alone at the tail of the run.
 - Requests are split (by time or by batch) **only** on explicit size errors; overload errors (`5xx`, `529`, transport) are retried with backoff, never multiplied.
 
-`run.json` → `Performance` records the durations, the number of work units and batches, getBatch availability per subscription/region, and calls, throttles and rates per limiter. Reference: 90 days, 1 account, 10 deployments: **~2.3 min with `-NoLatency` (180 calls) vs ~15 min** for the previous sequential version, with 0 throttling events. The latency call adds ~50% more calls and its responses are slower: ~5.3 min with the default `-Parallel 6`, ~4 min with `-Parallel 12` (still 0 throttling events). When latency is not needed, `-NoLatency` is the fastest option; on large estates raise `-Parallel` (the limiters keep the request rate safe).
+`run.json` → `Performance` records the durations, the number of work units and batches, getBatch availability per subscription/region, and calls, throttles and rates per limiter. Reference: 90 days, 1 account, 10 deployments, with latency: **~1.4 min** (extraction 41 s) with the default `-Parallel 12`, vs ~4 min for the previous version and ~15 min for the original sequential one, with 0 throttling events. `-Parallel 12` is an empirically conservative default, not a guarantee: the shared limiters are what keep the request rate safe, so on large estates you can raise it and watch `Throttles` in `run.json`. When latency is not needed, `-NoLatency` cuts the number of calls by about a third.
 
 The resolution is fixed at one minute (PT1M), because the P95/P99 per minute are the goal of the tool.
 
