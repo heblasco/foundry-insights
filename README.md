@@ -20,7 +20,7 @@ pwsh -File .\scripts\Run-FoundryInsights.ps1 -TenantId <tenantId> -Days 30 -Fetc
 # -> .\output\foundry_<yyyyMMdd-HHmmss>Z\ with the extractor CSVs, the statistics CSVs and the Excel report
 ```
 
-`Run-FoundryInsights.ps1` checks PowerShell 7, Python 3.10+ and the packages (`-InstallPythonDeps` installs them), then runs the extractor and `foundry_token_stats.py` on the new run folder. Options: `-TenantId`, `-SubscriptionId`, `-Days`, `-RunName`, `-OutputRoot`, `-AuthMode`, `-PricesFile`, `-FetchPrices`, `-NoExcel`, `-Python`, and `-ExportArgs` for any other extractor parameter: a hashtable when called in-process (`& .\scripts\Run-FoundryInsights.ps1 -ExportArgs @{ IncludePtuUtilization = $true; Parallel = 8 }`) or a JSON string with `pwsh -File` (`-ExportArgs '{"IncludePtuUtilization": true, "Parallel": 8}'`).
+This runs the extraction **and** builds the statistics and the Excel report in one step (see [One-command run](#one-command-run-run-foundryinsightsps1)). `Export-FoundryTokenMetrics.ps1` alone only produces the extractor CSVs; the Excel report is created by `foundry_token_stats.py` (step 2).
 
 ## Requirements
 
@@ -38,7 +38,59 @@ pwsh -File .\scripts\Run-FoundryInsights.ps1 -TenantId <tenantId> -Days 30 -Fetc
   - The fast `metrics:getBatch` API (default `-MetricsApi Batch`) needs the metrics read permission **at subscription scope**. Where it is denied (401/403/404) the script switches that subscription and region to the per-resource ARM metrics API automatically; results are the same, only slower.
   - Quota (`usages` and `models` per region) requires **Reader at subscription level**; without it, deployments are flagged `NoQuotaAccess` and the rest of the extraction continues.
 
+## One-command run (`Run-FoundryInsights.ps1`)
+
+Recommended entry point for regular use: it chains the two steps below and leaves everything in a single timestamped folder.
+
+What it does, in order:
+
+1. **Checks prerequisites:** PowerShell 7, Python 3.10+ (it picks the first of `python`, `python3` or `py` that already has the packages, or the one given in `-Python`) and the packages in `requirements.txt` (duckdb, pandas, openpyxl). If a package is missing it stops with the `pip` command to run, or installs them with `-InstallPythonDeps`.
+2. **Extracts** with `Export-FoundryTokenMetrics.ps1` into a new folder `<OutputRoot>\<RunName>_<yyyyMMdd-HHmmss>Z` (UTC start time of the run).
+3. **Builds the report** with `foundry_token_stats.py --run-dir <that folder>`: statistics CSVs and `foundry-token-report_<ts>.xlsx`. It is skipped when `-ExportArgs` contains `InventoryOnly`.
+4. Prints `Done: <folder>`. Any failure (prerequisites, extraction or statistics) stops the script with an error.
+
+```powershell
+# Last 30 days, list prices from the Retail Prices API
+pwsh -File .\scripts\Run-FoundryInsights.ps1 -TenantId <tenantId> -Days 30 -FetchPrices
+
+# Your own price list, a fixed run name for the inventory of periodic runs (e.g. a daily scheduled task)
+pwsh -File .\scripts\Run-FoundryInsights.ps1 -TenantId <tenantId> -Days 1 -RunName mcap -PricesFile .\prices.example.csv
+# -> .\output\mcap_20261105-083000Z\
+
+# Extra extractor parameters: JSON with pwsh -File ...
+pwsh -File .\scripts\Run-FoundryInsights.ps1 -TenantId <tenantId> -ExportArgs '{"IncludePtuUtilization": true, "NoLatency": true}'
+# ... or a hashtable when invoked in-process
+& .\scripts\Run-FoundryInsights.ps1 -TenantId <tenantId> -ExportArgs @{ IncludePtuUtilization = $true; Parallel = 16 }
+
+# First run on a new machine: install the Python packages if they are missing
+pwsh -File .\scripts\Run-FoundryInsights.ps1 -TenantId <tenantId> -InstallPythonDeps
+```
+
+| Parameter | Default | Description |
+|---|---|---|
+| `-TenantId` | all visible tenants | Passed to the extractor. |
+| `-SubscriptionId` | all | Allow-list of subscriptions, passed to the extractor. |
+| `-Days` | 30 | Window back from the start of the current UTC hour (1–93). |
+| `-RunName` | `foundry` | Fixed base name of the run folder; only the timestamp changes. |
+| `-OutputRoot` | `.\output` | Parent folder of the run folders. |
+| `-AuthMode` | `Auto` | `Auto`, `AzCli`, `AzPowerShell` or `ManagedIdentity` (see Requirements). |
+| `-ExportArgs` | — | Any other extractor parameter (see [Extraction](#1-extraction)): a hashtable in-process, or a JSON object string with `pwsh -File`. Switches are `true`/`$true`. |
+| `-PricesFile` | — | Your price list (`--prices`, see [Estimated cost](#estimated-cost)). |
+| `-FetchPrices` | off | List prices from the Retail Prices API (`--fetch-prices`). |
+| `-NoExcel` | off | Statistics CSVs only, no Excel report (`--no-excel`). |
+| `-InstallPythonDeps` | off | `pip install -r requirements.txt` when packages are missing. |
+| `-Python` | auto-detected | Python executable to use (e.g. a virtual environment: `.\.venv\Scripts\python.exe`). |
+
+Notes:
+
+- Every run creates a **new folder**, so it does not resume an interrupted run. To resume, run the two steps manually with the same `-OutputDirectory` (see [Resuming and idempotency](#resuming-and-idempotency)) and then `foundry_token_stats.py --run-dir` on it.
+- Do not put `OutputDirectory`, `Days`, `AuthMode`, `TenantId` or `SubscriptionId` in `-ExportArgs`: they are set by the script itself and a duplicate fails with `Item has already been added`. Use the script parameters instead. For an explicit window, `StartTime`/`EndTime` in `-ExportArgs` take precedence over `-Days`.
+- An extraction that finishes as `Incomplete` (see `run.json` → `Completeness`) still produces the report; check that status before relying on the numbers.
+- The [container image](#container) uses it too: its example runs `Run-FoundryInsights.ps1` after `az login`.
+
 ## 1. Extraction
+
+`Export-FoundryTokenMetrics.ps1` writes the extractor CSVs only (no Excel). To get the statistics and the Excel report, run [step 2](#2-statistics-and-excel-report) on the run folder, or use [`Run-FoundryInsights.ps1`](#one-command-run-run-foundryinsightsps1) to do both.
 
 ```powershell
 # All visible tenants and subscriptions, last 30 days, 24 h chunks
