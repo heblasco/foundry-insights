@@ -397,6 +397,16 @@ function ConvertTo-CsvField($Value) {
 
 function ConvertTo-CsvLine([object[]]$Values) { [FoundryInsights.Csv]::Line($Values) }
 
+# Export-Csv formats numbers with the current culture (es-ES writes "1,39"); the analyzer expects invariant numbers.
+function Export-InvariantCsv([object[]]$InputObject, [string]$LiteralPath) {
+    $prev = [System.Globalization.CultureInfo]::CurrentCulture
+    try {
+        [System.Globalization.CultureInfo]::CurrentCulture = $Inv
+        $InputObject | Export-Csv -LiteralPath $LiteralPath -Encoding utf8NoBOM
+    }
+    finally { [System.Globalization.CultureInfo]::CurrentCulture = $prev }
+}
+
 function ConvertTo-UtcDate($Value) {
     if ($Value -is [datetime]) {
         if ($Value.Kind -eq [DateTimeKind]::Unspecified) { return [datetime]::SpecifyKind($Value, [DateTimeKind]::Utc) }

@@ -499,7 +499,7 @@ Invoke-Units @($resources | ForEach-Object { [pscustomobject]@{ Type = 'Discover
 }
 foreach ($o in $resources) { if ($o.Status -eq 'Pending') { $o.Status = 'Error'; $o.Message = 'Discovery failed (see run.log)' } }
 
-$resources | ForEach-Object {
+$resourceRows = @($resources | ForEach-Object {
     [pscustomobject]@{
         TenantId = $_.TenantId; SubscriptionId = $_.SubscriptionId; SubscriptionName = $_.SubscriptionName
         ResourceGroup = $_.ResourceGroup; ResourceName = $_.Name; Kind = $_.Kind; Location = $_.Location; Sku = $_.Sku
@@ -508,7 +508,8 @@ $resources | ForEach-Object {
                     "$($_.Key)=$($_.Value.Model):$($_.Value.Version):$($_.Value.Sku):$($_.Value.Capacity)" }) -join ';')
         Message = $_.Message; ResourceId = $_.Id
     }
-} | Export-Csv -LiteralPath $ResourcesFile -NoTypeInformation -Encoding utf8NoBOM
+})
+Export-InvariantCsv $resourceRows $ResourcesFile
 
 $targets = @($resources | Where-Object Status -eq 'OpenAI')
 $resources | Group-Object Status | ForEach-Object { Write-Log "Accounts $($_.Name): $($_.Count)" }
@@ -585,8 +586,8 @@ foreach ($key in ($quotaGroups.Keys | Sort-Object)) {
             })
     }
 }
-$depRows | Export-Csv -LiteralPath (Join-Path $OutputDirectory 'deployments.csv') -NoTypeInformation -Encoding utf8NoBOM
-$quotaRows | Export-Csv -LiteralPath (Join-Path $OutputDirectory 'quota.csv') -NoTypeInformation -Encoding utf8NoBOM
+Export-InvariantCsv $depRows (Join-Path $OutputDirectory 'deployments.csv')
+Export-InvariantCsv $quotaRows (Join-Path $OutputDirectory 'quota.csv')
 Write-Log "Quota snapshot: $($quotaRows.Count) quota row(s), $($depRows.Count) deployment(s); unmapped: $(@($depRows | Where-Object { $_.QuotaMatch -notin 'ModelsApi', 'NameMatch' }).Count)"
 if ($quotaFailures) { Write-Log "Quota not readable for $quotaFailures subscription/region pair(s): Reader at subscription scope is required." 'WARN' }
 
