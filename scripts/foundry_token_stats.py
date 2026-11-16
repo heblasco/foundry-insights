@@ -143,10 +143,15 @@ def load(con: duckdb.DuckDBPyConnection, run_dirs: list[Path]) -> dict:
     for table, fname, cols in (("deps", "deployments.csv", DEP_COLS), ("quota", "quota.csv", QUOTA_COLS)):
         files = [str(d / fname) for d in run_dirs if (d / fname).exists() and (d / fname).stat().st_size > 0]
         if files:
-            con.execute(f"CREATE TABLE {table} AS SELECT * FROM read_csv($f, header = true, auto_detect = false, columns = $c)",
-                        {"f": files, "c": cols})
+            # Runs exported before the invariant-culture fix may hold locale decimals ("1,39"); numbers never have
+            # group separators there, so a comma can only be the decimal separator. Empty fields stay NULL.
+            proj = ", ".join(f"CAST(replace(\"{k}\", ',', '.') AS DOUBLE) AS \"{k}\"" if v == "DOUBLE" else f'"{k}"'
+                             for k, v in cols.items())
+            con.execute(f"CREATE TABLE {table} AS SELECT {proj} FROM read_csv($f, header = true, auto_detect = false, columns = $c)",
+                        {"f": files, "c": {k: "VARCHAR" for k in cols}})
         else:
-            con.execute(f"CREATE TABLE {table} ({', '.join(f'{k} {v}' for k, v in cols.items())})")
+            defs = ", ".join(f'"{k}" {v}' for k, v in cols.items())
+            con.execute(f"CREATE TABLE {table} ({defs})")
     con.execute("ALTER TABLE deps ADD COLUMN rid VARCHAR")
     con.execute("UPDATE deps SET rid = lower(ResourceId), SubscriptionId = lower(SubscriptionId)")
     con.execute("UPDATE quota SET SubscriptionId = lower(SubscriptionId)")
