@@ -160,13 +160,21 @@ If a tenant requires MFA or a specific login:
 
 Failed tenants are recorded in `run.json` (`FailedTenants`).
 
+### Subscription selection
+
+- Subscriptions in state `Enabled`, `Warned` or `PastDue` are processed; `Disabled`, `Expired` and `Deleted` ones are skipped.
+- `-TenantId` and `-SubscriptionId` accept several values as an array or as one comma-separated string (`pwsh -File ... -SubscriptionId "id1,id2"`).
+- `-TenantId` is the tenant the subscriptions are **queried through**, not necessarily the one that owns them. With Azure Lighthouse or guest access, a subscription is listed from the sign-in tenant, so run without `-TenantId` (or pass that tenant).
+- Each requested `-SubscriptionId` that is not found is logged as a warning with the reason (disallowed state, inconclusive search because a tenant failed, or the tenant through which the signed-in identity actually reaches it). The reasons are also recorded in `run.json` → `MissingSubscriptions`, and the run is marked `Incomplete`. If none of the requested subscriptions is found, the script stops with an error instead of producing empty files.
+- `run.json` → `Subscriptions` lists every processed subscription (id, name, state and the tenant(s) it was queried through).
+
 ### Resuming and idempotency
 
 When the same folder is reused without window parameters, the original window is kept and only missing or failed chunks are queried. Each chunk is saved as an atomic file in `parts\`. If the window, chunk size or calls change, the script stops (fingerprint in `run.json`).
 
 - A successful chunk whose part file has been deleted is extracted again.
 - Only chunks whose calls all completed in the manifest are merged into the final CSV, so leftovers of an interrupted run never leak in.
-- `run.json` → `Completeness` reports `Complete` or `Incomplete`, with the expected calls, missing or unsuccessful calls, and missing part files.
+- `run.json` → `Completeness` reports `Complete` or `Incomplete`, with the expected calls, missing or unsuccessful calls, missing part files and requested subscriptions not found.
 - The folder is locked (`.run.lock`) while a run is active, so two scheduled runs cannot write to it at the same time.
 
 ### Output files (run folder)
@@ -244,7 +252,7 @@ Every output file carries the UTC timestamp of the statistics run (`<ts>` = `yyy
 
 | Sheet | Content |
 |---|---|
-| Summary | Generation date, window, runs, tenants (and failed tenants), number of deployments, deployments with 429, with 5xx and with no traffic, estimated cost, price notes, recommendation counts, minimum coverage and reading notes |
+| Summary | Generation date, window, runs, tenants (and failed tenants), subscriptions (name and id) and requested subscriptions not found, number of deployments, deployments with 429, with 5xx and with no traffic, estimated cost, price notes, recommendation counts, minimum coverage and reading notes |
 | Models | One row per deployment: subscription, region, account, model, version, SKU, capacity, TPM/RPM limits, Input/Output TPM P95/P99, TPM P99/max and peak (UTC), % TPM P99/max, RPM P99/max, % RPM max, 429, other 4xx, 5xx, error rate, latency P95, availability min, PTU utilization P95/P99/max, estimated cost, coverage, **Data status** and **Recommendation** |
 | Quotas | Per subscription + region + quota: limit, assigned, % assigned, quota TPM, TPM P99/max, % quota P99/max, 429, coverage and whether all consumers were extracted |
 
