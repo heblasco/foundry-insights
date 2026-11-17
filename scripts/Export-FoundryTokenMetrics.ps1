@@ -148,6 +148,9 @@ param(
 Set-StrictMode -Version 3.0
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+# 'pwsh -File' passes "a,b" as ONE string; also tolerate spaces, quotes and braces pasted around GUIDs.
+$TenantId = @($TenantId | ForEach-Object { $_ -split '[,;\s]+' } | ForEach-Object { $_.Trim('{}"''') } | Where-Object { $_ })
+$SubscriptionId = @($SubscriptionId | ForEach-Object { $_ -split '[,;\s]+' } | ForEach-Object { $_.Trim('{}"''') } | Where-Object { $_ })
 
 $CommonFile = Join-Path $PSScriptRoot 'FoundryInsights.Common.ps1'
 . $CommonFile
@@ -447,12 +450,14 @@ Initialize-Tokens $TenantId $tokenAudiences
 Write-Log ("Tokens: {0} ok, {1} failed in {2:N1} s" -f ($TenantId.Count * $tokenAudiences.Count - $TokenFailures.Count), $TokenFailures.Count, $tokenClock.Elapsed.TotalSeconds)
 
 $subsSeen = @{}
+$subsInfo = [ordered]@{}   # selected subscriptions: id -> { SubscriptionId, SubscriptionName, State, TenantIds (query tenants) }
+$excludedSubs = @{}        # requested subscriptions listed but skipped because of their state: id -> state
 $tenantSubs = [ordered]@{}
 $failedTenants = [System.Collections.Generic.List[string]]::new()
+# Warned / PastDue subscriptions are still readable; Disabled / Expired / Deleted are not.
+$ActiveSubStates = 'Enabled', 'Warned', 'PastDue'
 foreach ($t in $TenantId) {
-    try {
-        $subs = @(Get-ArmPaged $t '/subscriptions?api-version=2022-12-01' | Where-Object { $_.state -eq 'Enabled' })
-    }
+    try { $subs = @(Get-ArmPaged $t '/subscriptions?api-version=2022-12-01') }
     catch {
         Write-Log "Tenant ${t}: $($_.Exception.Message)" 'WARN'
         $failedTenants.Add($t); continue
@@ -461,11 +466,46 @@ foreach ($t in $TenantId) {
     # resources are de-duplicated by id after Resource Graph so a failing tenant path is not fatal.
     $list = @(foreach ($s in $subs) {
             if ($SubscriptionId -and $s.subscriptionId -notin $SubscriptionId) { continue }
-            if (-not $subsSeen.ContainsKey($s.subscriptionId)) { $subsSeen[$s.subscriptionId] = $s.displayName }
+            if ($s.state -notin $ActiveSubStates) {
+                if ($SubscriptionId) { $excludedSubs[$s.subscriptionId] = $s.state }
+                continue
+            }
+            if (-not $subsSeen.ContainsKey($s.subscriptionId)) {
+                $subsSeen[$s.subscriptionId] = $s.displayName
+                $subsInfo[$s.subscriptionId] = [ordered]@{ SubscriptionId = $s.subscriptionId; SubscriptionName = $s.displayName
+                    State = $s.state; TenantIds = [System.Collections.Generic.List[string]]::new() }
+            }
+            $subsInfo[$s.subscriptionId].TenantIds.Add($t)
             [pscustomobject]@{ Id = $s.subscriptionId; Name = $s.displayName }
         })
     if ($list.Count) { $tenantSubs[$t] = $list }
-    Write-Log "Tenant ${t}: $($list.Count) subscription(s)"
+    Write-Log "Tenant ${t}: $($list.Count) subscription(s) selected of $($subs.Count) visible"
+}
+
+# Requested subscriptions that no processed tenant returned: diagnose (read-only, never widens the scope).
+$missingSubs = [System.Collections.Generic.List[object]]::new()
+foreach ($id in @($SubscriptionId | Where-Object { $_ -and -not $subsSeen.ContainsKey($_) })) {
+    $reason = if ($excludedSubs.ContainsKey($id)) { "listed but state is '$($excludedSubs[$id])' (only $($ActiveSubStates -join '/') are read)" }
+    elseif ($failedTenants.Count) { "not found; listing failed for tenant(s) $($failedTenants -join ', '), so the search is inconclusive" }
+    else {
+        # Ask ARM with the default (home tenant) identity which tenant the subscription belongs to.
+        try {
+            $probe = Invoke-Arm -Tenant '' -Uri "/subscriptions/$([uri]::EscapeDataString($id))?api-version=2022-12-01"
+            "not visible from tenant(s) $($TenantId -join ', '); the signed-in identity reaches it as '$($probe.displayName)' " +
+            "(state $($probe.state), tenant $($probe.tenantId)) - e.g. through Azure Lighthouse or another directory. " +
+            'Run without -TenantId (or with the tenant used to sign in) to include it'
+        }
+        catch { "not visible from tenant(s) $($TenantId -join ', ') nor from the default sign-in tenant: check the id, the tenant and the Reader role ($($_.Exception.Message))" }
+    }
+    Write-Log "Subscription ${id}: $reason" 'WARN'
+    $missingSubs.Add([ordered]@{ SubscriptionId = $id; Reason = $reason })
+}
+if (-not $subsSeen.Count) {
+    $why = if ($SubscriptionId) { 'none of the requested -SubscriptionId values was found (see the warnings above)' }
+    elseif ($failedTenants.Count -eq $TenantId.Count) { 'subscription listing failed for every tenant (see the warnings above)' }
+    else { $null }
+    if ($why) { Write-Log "No subscription to process: $why." 'ERROR'; $RunLock.Dispose(); throw "No subscription to process: $why. Details in $script:LogFile" }
+    Write-Log "No active subscription is visible from tenant(s) $($TenantId -join ', ')." 'WARN'
 }
 
 $kindFilter = if ($IncludeAllKinds) { '' } else { "| where kind in~ ($((($Kind | ForEach-Object { "'$_'" }) -join ',')))" }
@@ -599,7 +639,9 @@ $runInfo = [ordered]@{
     AuthMode        = $AuthMode
     Tenants         = $TenantId
     FailedTenants   = @($failedTenants)
-    Subscriptions   = $subsSeen.Count
+    Subscriptions   = @($subsInfo.Values | ForEach-Object { [ordered]@{ SubscriptionId = $_.SubscriptionId
+                SubscriptionName = $_.SubscriptionName; State = $_.State; TenantIds = @($_.TenantIds) } })
+    MissingSubscriptions = @($missingSubs)
     TargetResources = @($targets | ForEach-Object Id)
 }
 $runInfo | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $RunFile -Encoding utf8NoBOM
@@ -781,7 +823,8 @@ foreach ($kv in ($Limiters.Snapshot() | Sort-Object Key)) {
 }
 $runInfo['LastRunAt'] = Format-Utc ([datetime]::UtcNow)
 $runInfo['Completeness'] = [ordered]@{
-    Status          = if ($missing + $bad + $noPart -eq 0) { 'Complete' } else { 'Incomplete' }
+    Status          = if ($missing + $bad + $noPart + $missingSubs.Count -eq 0) { 'Complete' } else { 'Incomplete' }
+    MissingSubscriptions = $missingSubs.Count
     ExpectedCalls   = $targets.Count * $chunks.Count * $Calls.Count
     MissingCalls    = $missing
     NotSuccessful   = $bad
@@ -814,5 +857,6 @@ Write-Log ("Done in {0:N0} s (extraction {1:N0} s, {2} unit(s), throttle events 
 if ($failedTenants.Count) { Write-Log "Tenants not accessible (run 'az login --tenant <id>' and re-run with the same -OutputDirectory): $($failedTenants -join ', ')" 'WARN' }
 if ($bad -or $missing -or $noPart) { Write-Log "Run incomplete: $bad call(s) not successful, $missing call(s) never recorded, $noPart part file(s) missing (see manifest.csv). Re-run with the same -OutputDirectory to retry them." 'WARN' }
 if ($skippedParts) { Write-Log "$skippedParts part file(s) of incomplete chunks were not merged" 'WARN' }
+if ($missingSubs.Count) { Write-Log "Requested subscription(s) not processed: $(@($missingSubs | ForEach-Object SubscriptionId) -join ', ') (reasons above and in run.json)" 'WARN' }
 $RunLock.Dispose()
 #endregion

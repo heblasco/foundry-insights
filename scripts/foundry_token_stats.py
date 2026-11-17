@@ -784,6 +784,7 @@ def recommend(m, quota_util, th: dict = THRESHOLDS):
 
 def run_meta(run_dirs: list[Path]):
     """run.json metadata of each extraction folder (one row per run)."""
+    import csv
     import pandas as pd
 
     def _join(v):
@@ -793,8 +794,22 @@ def run_meta(run_dirs: list[Path]):
     for d in run_dirs:
         r = json.loads((d / "run.json").read_text(encoding="utf-8-sig"))
         fp = r.get("Fingerprint", {})
+        subs, exhaustive = r.get("Subscriptions"), True
+        if isinstance(subs, list):
+            subs = {s["SubscriptionId"].lower(): s.get("SubscriptionName") or "" for s in subs if s.get("SubscriptionId")}
+        else:
+            # Older runs only stored a count: recover names from the inventory (subscriptions without accounts are lost).
+            subs, exhaustive = {}, False
+            res = d / "resources.csv"
+            if res.exists():
+                with res.open(encoding="utf-8-sig", newline="") as f:
+                    for row in csv.DictReader(f):
+                        if row.get("SubscriptionId"):
+                            subs.setdefault(row["SubscriptionId"].lower(), row.get("SubscriptionName") or "")
+        missing = [m.get("SubscriptionId", "").lower() for m in (r.get("MissingSubscriptions") or [])]
         runs.append({"RunName": d.name, "RunTimestamp": r.get("RunTimestamp", ""),
-                     "Tenants": _join(fp.get("Tenants")), "FailedTenants": _join(r.get("FailedTenants")),
+                     "Tenants": _join(r.get("Tenants") or fp.get("Tenants")), "FailedTenants": _join(r.get("FailedTenants")),
+                     "Subscriptions": subs, "SubscriptionsExhaustive": exhaustive, "MissingSubscriptions": _join(missing),
                      "TargetResources": len(r.get("TargetResources") or [])})
     return pd.DataFrame(runs)
 
@@ -893,12 +908,22 @@ def write_excel(path: Path, info: dict, runs, models, quotas, generated_at: str,
         f" ({int(monthly.notna().sum())} of {len(models)} deployments priced)"
     recs = models["Recommendation"].fillna("").str.split("; ").explode()
     rec_rows = [(f"  {k}", int(v)) for k, v in recs[recs.ne("") & recs.ne("OK")].value_counts().items()] or [("  None", "")]
+    subs: dict = {}
+    for s in runs["Subscriptions"]:
+        for k, v in s.items():
+            subs[k] = subs.get(k) or v
+    sub_txt = "\n".join(sorted(f"{n or '(name not available)'} ({k})" for k, n in subs.items())) or "None"
+    if not runs["SubscriptionsExhaustive"].all():
+        sub_txt += "\n(older run: only subscriptions with Cognitive Services accounts are listed)"
+    missing = sorted(set(", ".join(runs["MissingSubscriptions"]).split(", ")) - {""} - set(subs))
     summary = [
         ("Report generated (UTC)", generated_at),
         ("Analysed window (UTC)", f"{info['start']} -> {info['end']} ({info['window_minutes']:,} min)"),
         ("Runs", ", ".join(f"{r.RunName}" for r in runs.itertuples())),
         ("Tenants", ", ".join(sorted(set(", ".join(runs["Tenants"]).split(", ")) - {""}))),
         ("Failed tenants", ", ".join(sorted(set(", ".join(runs["FailedTenants"]).split(", ")) - {""})) or "None"),
+        (f"Subscriptions ({len(subs)})", sub_txt),
+        ("Requested subscriptions not found", ", ".join(missing) + " (see run.log / run.json)" if missing else "None"),
         ("Accounts with OpenAI metrics", len(info["targets"])),
         ("Deployments", len(models)),
         ("Deployments with 429", int((pd.to_numeric(models["429 requests"], errors="coerce") > 0).sum())),
