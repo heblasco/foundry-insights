@@ -470,8 +470,50 @@ def _pct(num, den):
     return (100.0 * num / den.where(den > 0)).round(2).replace([np.inf, -np.inf], np.nan)
 
 
-def limit_reports(con: duckdb.DuckDBPyConnection, stats, window_minutes: int):
+def _blank_to_na(s):
+    """Whitespace-only text counts as missing so name fallbacks can fill it."""
+    return s.mask(s.fillna("").astype(str).str.strip() == "")
+
+
+def subscription_names(con: duckdb.DuckDBPyConnection, run_dirs: list[Path]) -> dict:
+    """Lowercased subscription id -> display name, from every source that may carry it (first non-blank wins)."""
+    import csv
+    names: dict = {}
+
+    def add(sid, name):
+        sid, name = (sid or "").strip().lower(), (name or "").strip()
+        if sid and name and sid not in names:
+            names[sid] = name
+
+    for sql in ("SELECT SubscriptionId, SubscriptionName FROM quota",
+                "SELECT SubscriptionId, SubscriptionName FROM deps",
+                "SELECT split_part(lower(ResourceId), '/', 3), SubscriptionName FROM raw "
+                "WHERE coalesce(trim(SubscriptionName), '') <> '' GROUP BY ALL"):
+        for sid, name in con.execute(sql).fetchall():
+            add(sid, name)
+    for d in run_dirs:
+        res = d / "resources.csv"
+        if res.exists() and res.stat().st_size > 0:
+            with res.open(encoding="utf-8-sig", newline="") as f:
+                for row in csv.DictReader(f):
+                    add(row.get("SubscriptionId"), row.get("SubscriptionName"))
+        subs = json.loads((d / "run.json").read_text(encoding="utf-8-sig")).get("Subscriptions")
+        if isinstance(subs, list):
+            for s in subs:
+                add(s.get("SubscriptionId"), s.get("SubscriptionName"))
+    return names
+
+
+def _fill_sub_names(df, names: dict):
+    """Blank names come from the resolver; without any name the subscription id is shown instead."""
+    df["SubscriptionName"] = (_blank_to_na(df["SubscriptionName"]).fillna(df["SubscriptionId"].map(names))
+                              .fillna(df["SubscriptionId"]))
+    return df
+
+
+def limit_reports(con: duckdb.DuckDBPyConnection, stats, window_minutes: int, sub_names=None):
     """Per-minute consumption vs deployment rate limits and vs subscription/region quota."""
+    sub_names = sub_names or {}
     full = stats[stats["Mode"] == "FullWindow"]
     deps = con.execute("SELECT * FROM deps").df()
     quota = con.execute("SELECT * FROM quota").df()
@@ -490,11 +532,13 @@ def limit_reports(con: duckdb.DuckDBPyConnection, stats, window_minutes: int):
     dep["ModelName"] = dep["ModelName"].fillna(dep["MetricModel"])
     dep["QuotaName"] = dep["QuotaName"].fillna("Unmapped(deployment not found)")
     dep["ResourceId"] = dep["ResourceIdLower"].fillna(dep["ResourceId"])
+    dep["SubscriptionId"] = dep["ResourceId"].str.lower().str.split("/").str[2]
+    dep = _fill_sub_names(dep, sub_names)
     for s in ("P95", "P99", "Max"):
         dep[f"PctOfTPM_{s}"] = _pct(dep[f"Tokens_{s}"], dep["TokensPerMinuteLimit"])
     for s in ("P99", "Max"):
         dep[f"PctOfRPM_{s}"] = _pct(dep[f"Requests_{s}"], dep["RequestsPerMinuteLimit"])
-    dep_cols = ["SubscriptionName", "Region", "ResourceName", "DeploymentName", "ModelName", "ModelVersion", "DeploymentSku",
+    dep_cols = ["SubscriptionName", "SubscriptionId", "Region", "ResourceName", "DeploymentName", "ModelName", "ModelVersion", "DeploymentSku",
                 "Capacity", "TokensPerMinuteLimit", "RequestsPerMinuteLimit", "QuotaName",
                 "Tokens_P95", "Tokens_P99", "Tokens_Max", "Tokens_MaxTimestamp", "PctOfTPM_P95", "PctOfTPM_P99", "PctOfTPM_Max",
                 "Input_P99", "Input_Max", "Input_Sum", "Output_P99", "Output_Max", "Output_Sum",
@@ -518,8 +562,7 @@ def limit_reports(con: duckdb.DuckDBPyConnection, stats, window_minutes: int):
     q = quota.merge(agg.drop(columns=["TpmCap", "RpmCap"]), on=["SubscriptionId", "Region", "QuotaName"], how="right")
     qp = _pivot(full, "Quota", ["SubscriptionId", "Region", "QuotaName"])
     q = q.merge(qp, on=["SubscriptionId", "Region", "QuotaName"], how="outer")
-    sub_names = deps.groupby("SubscriptionId")["SubscriptionName"].first()
-    q["SubscriptionName"] = q["SubscriptionName"].fillna(q["SubscriptionId"].map(sub_names))
+    q = _fill_sub_names(q, sub_names)
     q["DeploymentType"] = q["DeploymentType"].fillna(q["QuotaName"].str.split(".").str[1])
     ptu = q["DeploymentType"].fillna("").str.contains("Provisioned")
     q["QuotaTPM"] = (q["Limit"] * q["TokensPerUnit"]).where(~ptu)
@@ -533,13 +576,13 @@ def limit_reports(con: duckdb.DuckDBPyConnection, stats, window_minutes: int):
         q[f"PctOfQuotaTPM_{s}"] = _pct(q[f"Tokens_{s}"], q["QuotaTPM"])
         q[f"PctOfAssignedTPM_{s}"] = _pct(q[f"Tokens_{s}"], q["AssignedTPM"].where(~ptu))
     q["PctOfQuotaRPM_Max"] = _pct(q["Requests_Max"], q["QuotaRPM"])
-    q_cols = ["SubscriptionName", "Region", "QuotaName", "DeploymentType", "Deployments",
+    q_cols = ["SubscriptionName", "SubscriptionId", "Region", "QuotaName", "DeploymentType", "Deployments",
               "Limit", "CurrentValue", "AssignedPct", "AssignedCapacity", "AllConsumersExtracted", "Unit", "TokensPerUnit", "QuotaTPM", "AssignedTPM",
               "Tokens_P95", "Tokens_P99", "Tokens_Max", "Tokens_MaxTimestamp",
               "PctOfQuotaTPM_P95", "PctOfQuotaTPM_P99", "PctOfQuotaTPM_Max",
               "PctOfAssignedTPM_P95", "PctOfAssignedTPM_P99", "PctOfAssignedTPM_Max",
               "RequestsPerUnit", "QuotaRPM", "Requests_P99", "Requests_Max", "PctOfQuotaRPM_Max",
-              "Throttled429_Sum", "Throttled429_ActiveMinutes", "Tokens_CompletenessPct", "SubscriptionId"]
+              "Throttled429_Sum", "Throttled429_ActiveMinutes", "Tokens_CompletenessPct"]
     q = q[q_cols].sort_values(["AssignedPct", "PctOfQuotaTPM_Max"], ascending=False, na_position="last")
     return dep, q
 
@@ -754,8 +797,7 @@ def recommend(m, quota_util, th: dict = THRESHOLDS):
     """Rule-based, explainable recommendations (one string per deployment, rules joined with '; ')."""
     import pandas as pd
     q = quota_util[["SubscriptionId", "Region", "QuotaName", "AssignedPct", "PctOfQuotaTPM_Max"]]
-    m = m.assign(SubscriptionId=m["ResourceId"].str.lower().str.split("/").str[2]).merge(
-        q, on=["SubscriptionId", "Region", "QuotaName"], how="left")
+    m = m.merge(q, on=["SubscriptionId", "Region", "QuotaName"], how="left")
     ptu = m["DeploymentSku"].fillna("").str.contains("Provisioned")
     thr = m["Throttled429_Sum"].fillna(0) > 0
     pct_max, pct_p99 = m["PctOfTPM_Max"], m["PctOfTPM_P99"]
@@ -779,7 +821,7 @@ def recommend(m, quota_util, th: dict = THRESHOLDS):
             rec[i].append(text)
     deleted = m["DataStatus"] == "Deployment deleted (Unmapped)"
     m["Recommendation"] = ["; ".join(r) if r else ("" if dl else "OK") for r, dl in zip(rec, deleted)]
-    return m.drop(columns=["SubscriptionId", "AssignedPct", "PctOfQuotaTPM_Max"])
+    return m.drop(columns=["AssignedPct", "PctOfQuotaTPM_Max"])
 
 
 def run_meta(run_dirs: list[Path]):
@@ -816,7 +858,8 @@ def run_meta(run_dirs: list[Path]):
 
 NA = "N/A"
 MODEL_COLS = {
-    "SubscriptionName": "Subscription", "Region": "Region", "ResourceName": "Account", "DeploymentName": "Deployment",
+    "SubscriptionName": "Subscription", "SubscriptionId": "Subscription ID", "Region": "Region",
+    "ResourceName": "Account", "DeploymentName": "Deployment",
     "ModelName": "Model", "ModelVersion": "Version", "DeploymentSku": "SKU", "Capacity": "Capacity",
     "TokensPerMinuteLimit": "TPM limit", "RequestsPerMinuteLimit": "RPM limit",
     "Input_P95": "Input TPM P95", "Input_P99": "Input TPM P99", "Output_P95": "Output TPM P95", "Output_P99": "Output TPM P99",
@@ -831,7 +874,8 @@ MODEL_COLS = {
     "TokensCoveragePct": "Coverage %", "DataStatus": "Data status", "Recommendation": "Recommendation",
 }
 QUOTA_XLS_COLS = {
-    "SubscriptionName": "Subscription", "Region": "Region", "QuotaName": "Quota", "DeploymentType": "Type",
+    "SubscriptionName": "Subscription", "SubscriptionId": "Subscription ID", "Region": "Region",
+    "QuotaName": "Quota", "DeploymentType": "Type",
     "Deployments": "Deployments", "Limit": "Limit", "CurrentValue": "Assigned", "AssignedPct": "% assigned",
     "QuotaTPM": "Quota TPM", "Tokens_P99": "TPM P99", "Tokens_Max": "TPM max", "Tokens_MaxTimestamp": "TPM peak (UTC)",
     "PctOfQuotaTPM_P99": "% quota P99", "PctOfQuotaTPM_Max": "% quota max", "Throttled429_Sum": "429 requests",
@@ -1008,7 +1052,7 @@ def main() -> None:
     stats = compute_stats(con, info["window_minutes"])
     day = daily(con)
     hour = hourly(con)
-    dep_lim, quota_util = limit_reports(con, stats, info["window_minutes"])
+    dep_lim, quota_util = limit_reports(con, stats, info["window_minutes"], subscription_names(con, run_dirs))
 
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc)

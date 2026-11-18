@@ -253,8 +253,10 @@ Every output file carries the UTC timestamp of the statistics run (`<ts>` = `yyy
 | Sheet | Content |
 |---|---|
 | Summary | Generation date, window, runs, tenants (and failed tenants), subscriptions (name and id) and requested subscriptions not found, number of deployments, deployments with 429, with 5xx and with no traffic, estimated cost, price notes, recommendation counts, minimum coverage and reading notes |
-| Models | One row per deployment: subscription, region, account, model, version, SKU, capacity, TPM/RPM limits, Input/Output TPM P95/P99, TPM P99/max and peak (UTC), % TPM P99/max, RPM P99/max, % RPM max, 429, other 4xx, 5xx, error rate, latency P95, availability min, PTU utilization P95/P99/max, estimated cost, coverage, **Data status** and **Recommendation** |
-| Quotas | Per subscription + region + quota: limit, assigned, % assigned, quota TPM, TPM P99/max, % quota P99/max, 429, coverage and whether all consumers were extracted |
+| Models | One row per deployment: subscription name and ID, region, account, model, version, SKU, capacity, TPM/RPM limits, Input/Output TPM P95/P99, TPM P99/max and peak (UTC), % TPM P99/max, RPM P99/max, % RPM max, 429, other 4xx, 5xx, error rate, latency P95, availability min, PTU utilization P95/P99/max, estimated cost, coverage, **Data status** and **Recommendation** |
+| Quotas | Per subscription (name and ID) + region + quota: limit, assigned, % assigned, quota TPM, TPM P99/max, % quota P99/max, 429, coverage and whether all consumers were extracted |
+
+Subscription names come from the first non-blank source: `quota.csv`, `deployments.csv`, the metrics, `resources.csv` or `run.json`. If none has a name, the subscription ID is shown. Re-running only the analyzer on an existing run folder (`python scripts/foundry_token_stats.py --run-dir <folder>`) refreshes the report without extracting again.
 
 Notes on the Models sheet:
 
