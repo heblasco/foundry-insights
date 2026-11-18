@@ -457,7 +457,8 @@ $failedTenants = [System.Collections.Generic.List[string]]::new()
 # Warned / PastDue subscriptions are still readable; Disabled / Expired / Deleted are not.
 $ActiveSubStates = 'Enabled', 'Warned', 'PastDue'
 foreach ($t in $TenantId) {
-    try { $subs = @(Get-ArmPaged $t '/subscriptions?api-version=2022-12-01') }
+    # Get-ArmPaged returns the List as one object; unwrap it so each subscription is iterated on its own.
+    try { $subs = (Get-ArmPaged $t '/subscriptions?api-version=2022-12-01').ToArray() }
     catch {
         Write-Log "Tenant ${t}: $($_.Exception.Message)" 'WARN'
         $failedTenants.Add($t); continue
@@ -474,6 +475,10 @@ foreach ($t in $TenantId) {
                 $subsSeen[$s.subscriptionId] = $s.displayName
                 $subsInfo[$s.subscriptionId] = [ordered]@{ SubscriptionId = $s.subscriptionId; SubscriptionName = $s.displayName
                     State = $s.state; TenantIds = [System.Collections.Generic.List[string]]::new() }
+            }
+            elseif ([string]::IsNullOrWhiteSpace($subsSeen[$s.subscriptionId]) -and -not [string]::IsNullOrWhiteSpace($s.displayName)) {
+                $subsSeen[$s.subscriptionId] = $s.displayName
+                $subsInfo[$s.subscriptionId].SubscriptionName = $s.displayName
             }
             $subsInfo[$s.subscriptionId].TenantIds.Add($t)
             [pscustomobject]@{ Id = $s.subscriptionId; Name = $s.displayName }
