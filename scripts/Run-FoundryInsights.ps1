@@ -3,8 +3,10 @@
     One-command FoundryInsights run: checks prerequisites, extracts per-minute metrics and builds the report.
 
 .DESCRIPTION
-    1. Checks PowerShell 7, Python 3.10+ and the Python packages in requirements.txt (-InstallPythonDeps
-       installs them with pip).
+    1. Checks PowerShell 7.2+, Python 3.10+ (the repository .venv first, then python, python3 or py) and the
+       Python packages in requirements.txt (-InstallPythonDeps installs them with pip).
+    Runs on Windows, Linux and macOS; foundry-insights.sh (bash) and foundry-insights.cmd (cmd.exe) at the
+    repository root are launchers that pass their arguments to this script.
     2. Runs Export-FoundryTokenMetrics.ps1 into a new timestamped folder (<OutputRoot>\<RunName>_<yyyyMMdd-HHmmss>Z).
     3. Runs foundry_token_stats.py on that folder (CSVs + Excel report).
     Any other Export-FoundryTokenMetrics.ps1 parameter can be passed through -ExportArgs: a hashtable when the
@@ -12,6 +14,9 @@
 
 .EXAMPLE
     pwsh -File .\scripts\Run-FoundryInsights.ps1 -TenantId <tenant> -Days 30 -FetchPrices
+
+.EXAMPLE
+    ./foundry-insights.sh -TenantId <tenant> -Days 30 -FetchPrices
 
 .EXAMPLE
     pwsh -File .\scripts\Run-FoundryInsights.ps1 -TenantId <tenant> -AuthMode ManagedIdentity -ExportArgs '{"IncludePtuUtilization": true, "Parallel": 8}'
@@ -39,24 +44,31 @@ Set-StrictMode -Version 3.0
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 
+# Checked first: Windows PowerShell 5.1 cannot parse -ExportArgs JSON (no -AsHashtable) nor run the extractor.
+if ($PSVersionTable.PSVersion -lt [version]'7.2') {
+    throw "PowerShell 7.2+ is required (running $($PSVersionTable.PSVersion)). Run: pwsh -File `"$PSCommandPath`" ... or use foundry-insights.cmd / foundry-insights.sh."
+}
+
 # -ExportArgs: a hashtable when called in-process (& .\Run-FoundryInsights.ps1), a JSON object with pwsh -File.
 if ($ExportArgs -is [string]) {
     try { $ExportArgs = $ExportArgs | ConvertFrom-Json -AsHashtable } catch { throw "-ExportArgs is not valid JSON: $ExportArgs" }
 }
 if ($ExportArgs -isnot [System.Collections.IDictionary]) { throw '-ExportArgs must be a hashtable or a JSON object string.' }
 
-if ($PSVersionTable.PSVersion.Major -lt 7) { throw 'PowerShell 7+ is required (pwsh).' }
 $versionCheck = 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)'
 $depsCheck = 'import duckdb, pandas, openpyxl'
 if (-not $Python) {
-    # Prefer the first Python 3.10+ that already has the packages; "python3" may be the Store stub or a bare install.
-    $valid = foreach ($candidate in 'python', 'python3', 'py') {
+    # Prefer the repository virtual environment (.venv), then the first Python 3.10+ on PATH that already has the
+    # packages; "python3" may be the Store stub or a bare install.
+    $venv = if ($IsWindows) { Join-Path $root '.venv\Scripts\python.exe' } else { Join-Path $root '.venv/bin/python' }
+    $candidates = @(if (Test-Path $venv -PathType Leaf) { $venv }) + 'python', 'python3', 'py'
+    $valid = foreach ($candidate in $candidates) {
         if (-not (Get-Command $candidate -CommandType Application -ErrorAction SilentlyContinue)) { continue }
         & $candidate -c $versionCheck 2>$null
         if ($LASTEXITCODE -eq 0) { $candidate }
     }
     if (-not $valid) { throw 'Python 3.10+ is required (python, python3 or py on PATH, or pass -Python).' }
-    $Python = @($valid | Where-Object { & $_ -c $depsCheck 2>$null; $LASTEXITCODE -eq 0 } | Select-Object -First 1)[0]
+    $Python = $valid | Where-Object { & $_ -c $depsCheck 2>$null; $LASTEXITCODE -eq 0 } | Select-Object -First 1
     if (-not $Python) { $Python = @($valid)[0] }
 }
 else {
@@ -67,7 +79,9 @@ else {
 if ($LASTEXITCODE) {
     if (-not $InstallPythonDeps) { throw "Missing Python packages. Run: $Python -m pip install -r requirements.txt (or use -InstallPythonDeps)." }
     & $Python -m pip install --quiet -r (Join-Path $root 'requirements.txt')
-    if ($LASTEXITCODE) { throw 'pip install failed.' }
+    if ($LASTEXITCODE) {
+        throw "pip install failed. If pip reports 'externally-managed-environment' (Linux/macOS system Python), create a virtual environment: $(if ($IsWindows) { 'py -m venv .venv' } else { 'python3 -m venv .venv' }) in $root and run again (it is used automatically)."
+    }
 }
 
 $runDir = Join-Path $OutputRoot ('{0}_{1:yyyyMMdd-HHmmss}Z' -f $RunName, [datetime]::UtcNow)

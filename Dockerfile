@@ -2,9 +2,9 @@
 # Build:  docker build -t foundry-insights .
 # Run (Azure CLI login inside the container, results written to ./output on the host):
 #   docker run --rm -it -v "${PWD}/output:/app/output" foundry-insights \
-#     -c "az login --use-device-code --tenant <tenant> && pwsh -File scripts/Run-FoundryInsights.ps1 -TenantId <tenant> -Days 30"
+#     -c "az login --use-device-code --tenant <tenant> && ./foundry-insights.sh -TenantId <tenant> -Days 30"
 # Managed identity (e.g. Azure Container Apps job / ACI with an identity):
-#   pwsh -File scripts/Run-FoundryInsights.ps1 -TenantId <tenant> -AuthMode ManagedIdentity
+#   ./foundry-insights.sh -TenantId <tenant> -AuthMode ManagedIdentity
 FROM mcr.microsoft.com/powershell:lts-ubuntu-22.04
 
 ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1 PYTHONDONTWRITEBYTECODE=1
@@ -21,9 +21,11 @@ RUN if [ -n "$PIP_INDEX_URL" ]; then export PIP_INDEX_URL; else unset PIP_INDEX_
  && python3 -m pip install -r requirements.txt
 COPY scripts/ scripts/
 COPY workbooks/ workbooks/
-COPY prices.example.csv README.md ./
+COPY prices.example.csv README.md foundry-insights.sh ./
+# Explicit chmod: the executable bit is lost when the image is built from a Windows checkout.
+RUN chmod 755 foundry-insights.sh
 
 RUN useradd --create-home fi && mkdir -p /app/output && chown -R fi /app
 USER fi
 ENTRYPOINT ["/bin/bash"]
-CMD ["-c", "pwsh -File scripts/Run-FoundryInsights.ps1 -?"]
+CMD ["-c", "./foundry-insights.sh --help"]

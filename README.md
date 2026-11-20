@@ -4,6 +4,7 @@ This project extracts per-minute metrics from every accessible subscription and 
 
 | Component | File |
 |---|---|
+| Launchers for bash (Linux, macOS, WSL, Git Bash) and cmd.exe | `foundry-insights.sh`, `foundry-insights.cmd` |
 | One-command run (prerequisite checks + extraction + report) | `scripts\Run-FoundryInsights.ps1` |
 | Extraction (PowerShell 7) | `scripts\Export-FoundryTokenMetrics.ps1` (+ `scripts\FoundryInsights.Common.ps1`) |
 | Statistics, prices, recommendations and Excel (Python + DuckDB) | `scripts\foundry_token_stats.py` |
@@ -13,6 +14,8 @@ This project extracts per-minute metrics from every accessible subscription and 
 
 ## Quick start
 
+PowerShell (Windows, Linux or macOS):
+
 ```powershell
 pip install -r requirements.txt
 az login --tenant <tenantId>
@@ -20,11 +23,20 @@ pwsh -File .\scripts\Run-FoundryInsights.ps1 -TenantId <tenantId> -Days 30 -Fetc
 # -> .\output\foundry_<yyyyMMdd-HHmmss>Z\ with the extractor CSVs, the statistics CSVs and the Excel report
 ```
 
-This runs the extraction **and** builds the statistics and the Excel report in one step (see [One-command run](#one-command-run-run-foundryinsightsps1)). `Export-FoundryTokenMetrics.ps1` alone only produces the extractor CSVs; the Excel report is created by `foundry_token_stats.py` (step 2).
+bash (Linux, macOS, WSL):
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+az login --tenant <tenantId>
+./foundry-insights.sh -TenantId <tenantId> -Days 30 -FetchPrices
+# -> ./output/foundry_<yyyyMMdd-HHmmss>Z/
+```
+
+This runs the extraction **and** builds the statistics and the Excel report in one step (see [One-command run](#one-command-run-run-foundryinsightsps1) and [Running on Windows, Linux and macOS](#running-on-windows-linux-and-macos)). `Export-FoundryTokenMetrics.ps1` alone only produces the extractor CSVs; the Excel report is created by `foundry_token_stats.py` (step 2).
 
 ## Requirements
 
-- PowerShell 7.2 or later (`pwsh`).
+- PowerShell 7.2 or later (`pwsh`) on every OS, including Linux and macOS (see [Running on Windows, Linux and macOS](#running-on-windows-linux-and-macos)). Windows PowerShell 5.1 is not supported.
 - One authentication provider (`-AuthMode`, default `Auto`):
   - `AzCli`: Azure CLI with a signed-in session (`az login`). Chosen by `Auto` when `az` is installed.
   - `AzPowerShell`: `Connect-AzAccount` (module `Az.Accounts`). Chosen by `Auto` when `az` is missing.
@@ -44,7 +56,7 @@ Recommended entry point for regular use: it chains the two steps below and leave
 
 What it does, in order:
 
-1. **Checks prerequisites:** PowerShell 7, Python 3.10+ (it picks the first of `python`, `python3` or `py` that already has the packages, or the one given in `-Python`) and the packages in `requirements.txt` (duckdb, pandas, openpyxl). If a package is missing it stops with the `pip` command to run, or installs them with `-InstallPythonDeps`.
+1. **Checks prerequisites:** PowerShell 7.2+, Python 3.10+ (it uses the repository virtual environment `.venv` if present, otherwise the first of `python`, `python3` or `py` that already has the packages, or the one given in `-Python`) and the packages in `requirements.txt` (duckdb, pandas, openpyxl). If a package is missing it stops with the `pip` command to run, or installs them with `-InstallPythonDeps`.
 2. **Extracts** with `Export-FoundryTokenMetrics.ps1` into a new folder `<OutputRoot>\<RunName>_<yyyyMMdd-HHmmss>Z` (UTC start time of the run).
 3. **Builds the report** with `foundry_token_stats.py --run-dir <that folder>`: statistics CSVs and `foundry-token-report_<ts>.xlsx`. It is skipped when `-ExportArgs` contains `InventoryOnly`.
 4. Prints `Done: <folder>`. Any failure (prerequisites, extraction or statistics) stops the script with an error.
@@ -79,14 +91,60 @@ pwsh -File .\scripts\Run-FoundryInsights.ps1 -TenantId <tenantId> -InstallPython
 | `-FetchPrices` | off | List prices from the Retail Prices API (`--fetch-prices`). |
 | `-NoExcel` | off | Statistics CSVs only, no Excel report (`--no-excel`). |
 | `-InstallPythonDeps` | off | `pip install -r requirements.txt` when packages are missing. |
-| `-Python` | auto-detected | Python executable to use (e.g. a virtual environment: `.\.venv\Scripts\python.exe`). |
+| `-Python` | auto-detected | Python executable to use (e.g. a virtual environment outside the repository: `.\venvs\fi\Scripts\python.exe` or `~/venvs/fi/bin/python`). |
 
 Notes:
 
 - Every run creates a **new folder**, so it does not resume an interrupted run. To resume, run the two steps manually with the same `-OutputDirectory` (see [Resuming and idempotency](#resuming-and-idempotency)) and then `foundry_token_stats.py --run-dir` on it.
 - Do not put `OutputDirectory`, `Days`, `AuthMode`, `TenantId` or `SubscriptionId` in `-ExportArgs`: they are set by the script itself and a duplicate fails with `Item has already been added`. Use the script parameters instead. For an explicit window, `StartTime`/`EndTime` in `-ExportArgs` take precedence over `-Days`.
 - An extraction that finishes as `Incomplete` (see `run.json` → `Completeness`) still produces the report; check that status before relying on the numbers.
-- The [container image](#container) uses it too: its example runs `Run-FoundryInsights.ps1` after `az login`.
+- The [container image](#container) uses it too: its example runs `foundry-insights.sh` after `az login`.
+
+## Running on Windows, Linux and macOS
+
+All the scripts run with **PowerShell 7.2+ (`pwsh`)**, which is cross-platform, and Python 3.10+. The extraction is PowerShell, so `pwsh` is required on Linux and macOS too; the launchers at the repository root only find `pwsh` and pass every argument unchanged to `scripts/Run-FoundryInsights.ps1`, so the parameters are the same everywhere (`-TenantId`, `-Days`, `-FetchPrices`, ...).
+
+| Shell | Command |
+|---|---|
+| PowerShell 7 (any OS) | `pwsh -File ./scripts/Run-FoundryInsights.ps1 <args>` or, in-process, `& ./scripts/Run-FoundryInsights.ps1 <args>` |
+| bash / zsh (Linux, macOS, WSL, Git Bash) | `./foundry-insights.sh <args>` |
+| cmd.exe (Windows) | `foundry-insights.cmd <args>` |
+| Windows PowerShell 5.1 | Not supported: run `pwsh -File .\scripts\Run-FoundryInsights.ps1 <args>` (the script stops with that hint if started from 5.1). |
+
+`--help` (or `-h`) on either launcher shows the script help. If `pwsh` is not on `PATH`, the launchers print how to install it and exit with 127 (bash) or 9009 (cmd); set `FI_PWSH` to use a specific `pwsh` executable. The exit code of the run is returned unchanged, so the launchers can be used from cron, systemd timers, Task Scheduler or CI.
+
+Setup per OS:
+
+| | Windows | macOS | Linux (Ubuntu/Debian example) |
+|---|---|---|---|
+| PowerShell 7 | `winget install --id Microsoft.PowerShell` | `brew install --cask powershell` | [Install PowerShell on Linux](https://learn.microsoft.com/powershell/scripting/install/installing-powershell-on-linux) (`apt`, `snap`, ...) |
+| Azure CLI | `winget install --id Microsoft.AzureCLI` | `brew install azure-cli` | `curl -sL https://aka.ms/InstallAzureCLIDeb \| sudo bash` |
+| Python packages | `py -m venv .venv`<br>`.\.venv\Scripts\pip install -r requirements.txt` | `python3 -m venv .venv`<br>`.venv/bin/pip install -r requirements.txt` | `sudo apt install python3-venv`<br>`python3 -m venv .venv`<br>`.venv/bin/pip install -r requirements.txt` |
+
+A `.venv` folder at the repository root is used automatically, so there is no need to activate it or pass `-Python`. It is also the way around `error: externally-managed-environment` (PEP 668) that recent Linux distributions and Homebrew Python return for `pip install` (and therefore for `-InstallPythonDeps`) outside a virtual environment.
+
+```bash
+# bash: first run, periodic runs and extra extractor parameters
+chmod +x foundry-insights.sh   # only if the executable bit was lost (e.g. copied from a zip)
+./foundry-insights.sh -TenantId <tenantId> -Days 30 -FetchPrices
+./foundry-insights.sh -TenantId <tenantId> -Days 1 -RunName mcap -PricesFile ./prices.example.csv
+./foundry-insights.sh -TenantId <tenantId> -ExportArgs '{"IncludePtuUtilization": true, "Parallel": 8}'
+./foundry-insights.sh -TenantId "<tenantA>,<tenantB>" -SubscriptionId "<id1>,<id2>"
+```
+
+```bat
+:: cmd.exe
+foundry-insights.cmd -TenantId <tenantId> -Days 30 -FetchPrices
+foundry-insights.cmd -TenantId <tenantId> -ExportArgs "{\"IncludePtuUtilization\": true}"
+```
+
+Notes:
+
+- `-ExportArgs` JSON: in bash wrap it in single quotes; in cmd.exe wrap it in double quotes and escape the inner ones as `\"`. From PowerShell 7 prefer the in-process call with a hashtable (`-ExportArgs @{ IncludePtuUtilization = $true }`), which avoids any quoting.
+- Several tenants or subscriptions from bash or cmd: one comma-separated string (`"id1,id2"`).
+- Paths: use `/` on Linux and macOS (`-OutputRoot ./output`, `-PricesFile ./prices.csv`); both `/` and `\` work on Windows.
+- WSL is a separate Linux: install `pwsh`, Azure CLI and the `.venv` inside WSL and sign in there (`az login`); the Windows installations are not used.
+- Git keeps `foundry-insights.sh` with LF line endings and `foundry-insights.cmd` with CRLF (`.gitattributes`), so both work from a checkout on any OS.
 
 ## 1. Extraction
 
@@ -376,7 +434,7 @@ docker build -t foundry-insights .
 #   docker build --build-arg PIP_INDEX_URL=https://<your-feed>/pypi/simple/ -t foundry-insights .
 # Interactive Azure CLI login inside the container; results are written to ./output on the host
 docker run --rm -it -v "$PWD/output:/app/output" foundry-insights \
-  -c "az login --use-device-code --tenant <tenantId> && pwsh -File scripts/Run-FoundryInsights.ps1 -TenantId <tenantId> -Days 30 -FetchPrices"
+  -c "az login --use-device-code --tenant <tenantId> && ./foundry-insights.sh -TenantId <tenantId> -Days 30 -FetchPrices"
 ```
 
 For unattended runs (e.g. an Azure Container Apps job with a managed identity that has Reader + Monitoring Reader), use `-AuthMode ManagedIdentity` and mount or upload `/app/output`.
